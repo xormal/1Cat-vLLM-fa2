@@ -164,6 +164,21 @@ class AutoGPTQConfig(QuantizationConfig):
         self.modules_in_block_to_quantize = modules_in_block_to_quantize or []
         # used to identify GPTQ model quantized by autoround
         self.autoround_version = full_config.get("autoround_version", "")
+        # [fa2_sm70 patch 02, порт в это дерево] ПРОНЕСТИ `modules_to_not_convert`, как это уже
+        # делает конфиг AWQ. Для решения "квантовать или нет" он здесь не нужен (это делает
+        # `dynamic`), но его читают МОДЕЛИ: `qwen3_5._uses_split_gdn_input_projections()` спрашивает,
+        # остались ли `linear_attn.in_proj_a/b` в fp16, и по ответу строит либо РАЗДЕЛЬНЫЕ
+        # `in_proj_qkvz` + `in_proj_ba`, либо один слитный `in_proj_qkvz`.
+        #
+        # ПОЧЕМУ ЭТО НЕ КОСМЕТИКА. Без атрибута GPTQ всегда выглядит «нераздельным», модель ждёт
+        # слитный `in_proj_qkvz.weight`, которого в раздельном квантованном слепке НЕТ -- и загрузка
+        # проходит С ОДНИМ ПРЕДУПРЕЖДЕНИЕМ, после чего сетка выдаёт чистый мусор. Отказа нет,
+        # падения нет: ровно тот класс дефекта, который ловится только чтением ответа.
+        #
+        # ИМЯ АТРИБУТА ВАЖНО. Потребитель перебирает `modules_to_not_convert` / `ignored_layers` /
+        # `ignore` на самом объекте и `config["ignore"]` в сыром словаре; поле `full_config` он не
+        # смотрит, поэтому «оно и так лежит в full_config» -- недостаточно.
+        self.modules_to_not_convert = full_config.get("modules_to_not_convert") or []
 
     def __repr__(self) -> str:
         return (

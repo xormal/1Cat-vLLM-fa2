@@ -144,6 +144,20 @@ def _get_backend_priorities(
             ]
         else:
             if (
+                envs.VLLM_SM70_FA2
+                and device_capability.major == 7
+                and device_capability.minor == 0
+            ):
+                # NOTE: _get_backend_priorities is @cache'd, so VLLM_SM70_FA2 must be set before the
+                # first call -- i.e. in the environment, not mutated at runtime.
+                return [
+                    AttentionBackendEnum.FA2_SM70,
+                    AttentionBackendEnum.FLASH_ATTN_V100,
+                    AttentionBackendEnum.TRITON_ATTN,
+                    AttentionBackendEnum.FLEX_ATTENTION,
+                    AttentionBackendEnum.TURBOQUANT,
+                ]
+            if (
                 envs.VLLM_SM70_FLASH_ATTN_V100
                 and device_capability.major == 7
                 and device_capability.minor == 0
@@ -519,6 +533,19 @@ class CudaPlatformBase(Platform):
     @classmethod
     def check_if_supports_dtype(cls, dtype: torch.dtype):
         if dtype == torch.bfloat16:  # noqa: SIM102
+            # [fa2_sm70 patch 04] ОТКАЗ ПО НОМЕРУ АРХИТЕКТУРЫ, А НЕ ПО ФАКТУ.
+            # sm_70 действительно не имеет bf16 в железе, но это не значит, что модель в bf16 на нём
+            # не работает: веса приводятся к fp16 при загрузке, а наши ядра считают в fp16 с
+            # накоплением в fp32. Именно так на этой машине уже запускалась Gemma-4. Проверка же
+            # смотрит ТОЛЬКО на capability >= 80 и отвергает конфигурацию до того, как кто-либо
+            # успел сказать, что делать. Вентиль по умолчанию ВЫКЛЮЧЕН: включение -- решение
+            # вызывающего, а не тихое умолчание.
+            if bool(int(os.getenv("FA2SM70_ALLOW_BF16", "0"))) and cls.has_device_capability(70):
+                logger.warning_once(
+                    "FA2SM70_ALLOW_BF16=1: принимаем bfloat16 на sm_70. В железе bf16 нет, "
+                    "веса и активации пойдут через fp16 -- диапазон уже, точность проверяйте сами."
+                )
+                return
             if not cls.has_device_capability(80):
                 capability = cls.get_device_capability()
                 gpu_name = cls.get_device_name()

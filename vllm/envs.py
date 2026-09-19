@@ -214,6 +214,7 @@ if TYPE_CHECKING:
     VLLM_MOE_DP_CHUNK_SIZE: int = 256
     VLLM_ENABLE_MOE_DP_CHUNK: bool = False
     VLLM_SM70_FLASH_ATTN_V100: bool = True
+    VLLM_SM70_FA2: bool = False
     VLLM_SM70_PROFILE_TRACE: bool = False
     VLLM_SM70_DECODE_EVENT_TRACE: bool = False
     VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS: float = 1.0
@@ -1878,6 +1879,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FLASH_ATTN_V100": lambda: bool(
         int(os.getenv("VLLM_SM70_FLASH_ATTN_V100", "1"))
     ),
+    # Put our own sm_70 backend (FA2_SM70) first in the priority list. Off by default: turning it on
+    # is a decision, and a silent default would make an A/B meaningless.
+    "VLLM_SM70_FA2": lambda: bool(int(os.getenv("VLLM_SM70_FA2", "0"))),
     "VLLM_SM70_PROFILE_TRACE": lambda: bool(
         int(os.getenv("VLLM_SM70_PROFILE_TRACE", "0"))
         or int(os.getenv("VLLM_SM70_DECODE_TILE_PROFILE", "0"))

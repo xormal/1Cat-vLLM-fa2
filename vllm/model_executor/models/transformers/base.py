@@ -454,6 +454,44 @@ class Base(
                 # attrsetter in case the module is nested (e.g. "text_model.norm")
                 attrsetter(name)(self.model, PPMissingLayer())
 
+    # [fa2_sm70] ПРОЕКЦИИ K/V ГОЛОВЫ, КОТОРОЙ МЕНЬШЕ, ЧЕМ РАНГОВ, НАДО РЕПЛИЦИРОВАТЬ, А НЕ РЕЗАТЬ.
+    # У глобальных слоёв Gemma-4 ОДНА KV-голова размером 512. `tp_plan` модели (он общий на все
+    # слои) велит резать k_proj/v_proj по выходной размерности -- при TP=2 каждый ранг получает 256,
+    # то есть делится САМА ГОЛОВА. А `create_attention_instances` (и штатный
+    # `ModelConfig.get_num_kv_heads`) считает по правилу max(1, всего_kv // tp) = 1 и ждёт полные
+    # 512. Отсюда подъём падал на `shape '[1, 8192, -1, 512]' is invalid for input of size 2097152`
+    # (ровно половина). Штатная семантика vLLM для «голов меньше, чем рангов» -- РЕПЛИКАЦИЯ, её и
+    # ставим. Цена: k_proj глобальных слоёв (3840x512) лежит на каждом ранге целиком -- 4 МБ на слой,
+    # 8 слоёв, 32 МБ; против делимой половины это ничто.
+    KV_PROJ_NAMES = ("k_proj", "v_proj")
+
+    def _kv_proj_replication(self, parent: nn.Module, child_name: str, linear: nn.Linear) -> bool:
+        """True, если эту проекцию K/V надо РЕПЛИЦИРОВАТЬ вместо шардирования по колонкам."""
+        tp_size = self.tp_group.world_size
+        if tp_size <= 1 or child_name not in self.KV_PROJ_NAMES:
+            return False
+        head_dim = getattr(parent, "head_dim", None)
+        if not isinstance(head_dim, int) or head_dim <= 0:
+            return False
+        out_features = linear.out_features
+        if out_features % head_dim != 0:
+            return False
+        kv_heads = out_features // head_dim
+        if kv_heads >= tp_size:
+            return False  # делится честно по головам -- обычный colwise верен
+        # Сколько голов ждёт от нас движок (то же правило, что в ModelConfig.get_num_kv_heads).
+        expected = max(1, kv_heads // tp_size)
+        if expected != kv_heads:
+            # Промежуточный случай (например 2 головы на 4 ранга): нужна ЧАСТИЧНАЯ репликация,
+            # одной заменой класса не выражается. Молчать нельзя -- иначе подъём упадёт на форме.
+            logger.warning(
+                "[fa2_sm70] %s: KV-голов %d при tp=%d -- ни целая репликация, ни целое "
+                "шардирование. Оставлено как в tp_plan; ждите несовпадения форм.",
+                child_name, kv_heads, tp_size,
+            )
+            return False
+        return True
+
     def recursive_replace(self):
         """Recursively replace modules in the model as needed.
 
@@ -507,6 +545,19 @@ class Base(
                     # LinearBase, so we set a default style which causes any
                     # unspecified layers to be replaced with ReplicatedLinear
                     style = tp_plan.get(pattern, "replicate")
+                    # [fa2_sm70] см. _kv_proj_replication: голова, которой меньше, чем рангов,
+                    # реплицируется целиком. Гейт сам себя выключает при tp=1.
+                    if self._kv_proj_replication(module, child_name, child_module):
+                        logger.info(
+                            "[fa2_sm70] %s: KV-голов %d < рангов %d -> РЕПЛИКАЦИЯ "
+                            "(вместо '%s'), выход %d остаётся целым",
+                            qual_name,
+                            child_module.out_features // module.head_dim,
+                            self.tp_group.world_size,
+                            style,
+                            child_module.out_features,
+                        )
+                        style = "replicate"
                     new_module = replace_linear_class(
                         child_module, style, self.quant_config, prefix=qual_name
                     )
@@ -552,15 +603,56 @@ class Base(
         pp_size = self.pp_group.world_size
         start, end = get_pp_indices(text_config.num_hidden_layers, pp_rank, pp_size)
 
+        # [fa2_sm70] ГЕОМЕТРИЯ ВНИМАНИЯ БЫВАЕТ РАЗНОЙ ПО СЛОЯМ, А НЕ ТОЛЬКО ОКНО.
+        # У Gemma-4 сорок скользящих слоёв идут с head_dim=256 и восемью KV-головами, а восемь
+        # глобальных -- с head_dim=512 и ОДНОЙ KV-головой (global_head_dim /
+        # num_global_key_value_heads в text_config). Здесь же head_size и num_kv_heads брались один
+        # раз на всю модель, поэтому глобальные слои получали чужую форму, и подъём падал на
+        # `shape '[1, 8192, -1, 512]' is invalid for input of size 2097152` -- то есть ровно на
+        # 8192*256 против ожидаемых 8192*512. Читаем послойно; если полей нет, поведение прежнее.
+        global_head_size = getattr(text_config, "global_head_dim", None)
+        global_kv_heads_total = getattr(text_config, "num_global_key_value_heads", None)
+        layer_types = getattr(self.config, "layer_types", None) or getattr(
+            text_config, "layer_types", None
+        )
+        # Окно тоже живёт в text_config у мультимодальных конфигураций -- брать его с верхнего
+        # уровня значит получить AttributeError на Gemma-4 (или, что хуже, None и полное внимание
+        # там, где модель обучалась со скользящим).
+        sliding_window_cfg = getattr(self.config, "sliding_window", None)
+        if sliding_window_cfg is None:
+            sliding_window_cfg = getattr(text_config, "sliding_window", None)
+        tp_size = self.parallel_config.tensor_parallel_size
+
+        logger.info(
+            "[fa2_sm70] геометрия: layer_types=%s окно=%s global_head_dim=%s global_kv=%s "
+            "базовые head_size=%s num_kv=%s num_heads=%s tp=%s",
+            (None if layer_types is None else
+             {t: list(layer_types).count(t) for t in set(layer_types)}),
+            sliding_window_cfg, global_head_size, global_kv_heads_total,
+            head_size, num_kv_heads, num_heads, tp_size,
+        )
+
         attention_instances = {}
         for i in range(start, end):
             # Handle interleaved sliding window attention
             per_layer_sliding_window = None
-            if (
-                hasattr(self.config, "layer_types")
-                and self.config.layer_types[i] == "sliding_attention"
-            ):
-                per_layer_sliding_window = self.config.sliding_window
+            layer_head_size = head_size
+            layer_num_kv_heads = num_kv_heads
+            if layer_types is not None and layer_types[i] == "sliding_attention":
+                per_layer_sliding_window = sliding_window_cfg
+            elif layer_types is not None and layer_types[i] == "full_attention":
+                if global_head_size is not None:
+                    layer_head_size = int(global_head_size)
+                if global_kv_heads_total is not None:
+                    # Как и штатный get_num_kv_heads: при малом числе KV-голов они РЕПЛИЦИРУЮТСЯ по
+                    # рангам, а не режутся в ноль.
+                    layer_num_kv_heads = max(1, int(global_kv_heads_total) // tp_size)
+
+            if i < 8:
+                logger.info(
+                    "[fa2_sm70]   слой %d тип=%s head_size=%s num_kv=%s окно=%s", i,
+                    None if layer_types is None else layer_types[i],
+                    layer_head_size, layer_num_kv_heads, per_layer_sliding_window)
 
             attn_cls = (
                 EncoderOnlyAttention
@@ -569,11 +661,11 @@ class Base(
             )
             attention_instances[i] = attn_cls(
                 num_heads=num_heads,
-                head_size=head_size,
+                head_size=layer_head_size,
                 # NOTE: We use Llama scale as default, if it's set by
                 # Transformers, it's updated in vllm_flash_attention_forward
-                scale=head_size**-0.5,
-                num_kv_heads=num_kv_heads,
+                scale=layer_head_size**-0.5,
+                num_kv_heads=layer_num_kv_heads,
                 cache_config=self.cache_config,
                 quant_config=self.quant_config,
                 logits_soft_cap=logits_soft_cap,

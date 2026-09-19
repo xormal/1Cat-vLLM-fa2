@@ -1036,14 +1036,43 @@ def unify_kv_cache_spec_page_size(
             new_kv_cache_spec[layer_name] = layer_spec
         else:
             layer_page_size = layer_spec.page_size_bytes
+            pad_to = None
             if max_page_size % layer_page_size != 0:
-                raise NotImplementedError(
-                    "The page size of the layer is not divisible by the "
-                    "maximum page size. Cannot unify by adjusting block_size."
+                # [fa2_sm70] ДОБИТЬ СТРАНИЦУ ВМЕСТО ОТКАЗА.
+                # Раньше здесь был безусловный NotImplementedError, и он закрывал целый класс
+                # РАБОЧИХ конфигураций: модель с РАЗНОЙ геометрией слоёв плюс формат, который держит
+                # масштабы в странице. На Gemma-4 с int8_per_token_head скользящий слой даёт 66560 Б,
+                # глобальный 16512 Б, отношение 4.03 -- и подъём падал, хотя ядра всё умеют. В fp16 и
+                # e4m3 те же слои дают ровно 4, то есть отказ вызывала не геометрия, а байты масштабов.
+                # Механизм добивки в движке УЖЕ ЕСТЬ (`page_size_padded`, kv_cache_interface.py:149,
+                # плюс нарезка сырого буфера с шагом больше формы у раннера) -- он просто не был
+                # применён здесь.
+                ratio = max_page_size // layer_page_size
+                waste = (max_page_size - ratio * layer_page_size) / (ratio * layer_page_size) \
+                    if ratio > 0 else 1.0
+                # Порог не косметический: без него редкое соотношение дало бы добивку в разы, то есть
+                # тихую потерю памяти вместо честного отказа. Лучше упасть, чем молча съесть ёмкость.
+                if ratio <= 0 or waste > 0.05:
+                    raise NotImplementedError(
+                        "The page size of the layer is not divisible by the maximum page size, "
+                        f"and padding it would waste {waste:.1%} (> 5%). "
+                        f"layer={layer_page_size} B, max={max_page_size} B."
+                    )
+                # ДОБИВАЕТСЯ ИТОГОВАЯ СТРАНИЦА, А НЕ ИСХОДНАЯ. Ниже block_size умножается на ratio,
+                # поэтому реальный размер вырастет во столько же раз; добивка, посчитанная для
+                # старого block_size, оказалась бы МЕНЬШЕ реального размера и роняла бы утверждение
+                # в page_size_bytes. Ставим ровно максимум -- тогда после умножения страница сходится
+                # с ним по определению.
+                logger.info(
+                    "[fa2_sm70] страница слоя %d Б x%d = %d добита до %d Б (потери %.2f%%)",
+                    layer_page_size, ratio, ratio * layer_page_size, max_page_size, 100 * waste,
                 )
+                pad_to = max_page_size
             ratio = max_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio
-            new_spec = replace(layer_spec, block_size=new_block_size)
+            new_spec = replace(layer_spec, block_size=new_block_size,
+                               page_size_padded=pad_to if pad_to is not None
+                               else layer_spec.page_size_padded)
             assert new_spec.page_size_bytes == max_page_size
             new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec

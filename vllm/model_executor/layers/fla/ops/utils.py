@@ -87,7 +87,13 @@ def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        contiguous_args = (
+        # [fa2_sm70 #145] КОРТЕЖ, А НЕ ГЕНЕРАТОР.
+        # Скобки с `for` дают ГЕНЕРАТОР, и он одноразовый. При обычном вызове это сходит с рук
+        # (распаковывается ровно один раз), но при обходе графа dynamo такой объект — источник
+        # разрыва графа и повторного обхода, после которого распаковка даёт ПУСТО.
+        # Приведение к contiguous — не украшение: ядра fla читают плотные строки, и молча
+        # неверный результат при неплотном входе выглядит как исправная работа.
+        contiguous_args = tuple(
             i if not isinstance(i, torch.Tensor) else i.contiguous() for i in args
         )
         contiguous_kwargs = {
@@ -106,7 +112,13 @@ def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
                     tensor = value
                     break
 
-        if tensor is not None:
+        # [fa2_sm70 #145] ПОД ОБХОДОМ ГРАФА КОНТЕКСТ УСТРОЙСТВА НЕ СТАВИМ.
+        # `torch.accelerator.device_index(...)` dynamo обойти НЕ УМЕЕТ: при backend="eager" он
+        # падает прямо здесь (utils.py:110), а при inductor обход уходит в разрыв графа.
+        # Смысл контекста — выбрать карту по входному тензору; в воркере vLLM карта уже выбрана
+        # (`torch.cuda.set_device` на старте) и одна на процесс, поэтому под компиляцией это
+        # тождественная операция. Снимаем её только на время обхода, в обычном пути всё как было.
+        if tensor is not None and not torch.compiler.is_compiling():
             ctx = torch.accelerator.device_index(tensor.device.index)
         else:
             ctx = contextlib.nullcontext()

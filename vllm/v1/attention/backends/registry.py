@@ -48,6 +48,8 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     FLASHINFER_SM70 = (
         "vllm.v1.attention.backends.flashinfer_sm70.FlashInferSM70Backend"
     )
+    # HOOLIGAN sm_70 kernel class -- our own backend, deliberately NOT a patch on FLASH_ATTN_V100.
+    FA2_SM70 = "vllm.v1.attention.backends.fa2_sm70.FA2SM70Backend"
     FLASH_ATTN_DIFFKV = (
         "vllm.v1.attention.backends.flash_attn_diffkv.FlashAttentionDiffKVBackend"
     )
