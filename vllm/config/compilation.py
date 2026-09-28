@@ -767,6 +767,9 @@ class CompilationConfig:
         "vllm::qwen_gdn_attention_core_spec_commit",
         "vllm::qwen_gdn_attention_core_context",
         "vllm::qwen_gdn_attention_core_003_spec",
+        # [FA2/SM70, ПОРТ 07.2026] наше тело ядра GDN (qwen_gdn_linear_attn._forward_core_fa2):
+        # режим 'all' режет префилл по границам блоков с синхронизацией -- обязано быть точкой разреза.
+        "vllm::qwen_gdn_attention_core_fa2",
         "vllm::qwen_gdn_full_forward",
         "vllm::qwen_gdn_input_projection_core",
         "vllm::qwen_gdn_input_projection",

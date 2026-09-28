@@ -147,6 +147,10 @@ class AttentionSpec(KVCacheSpec):
     dtype: torch.dtype
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
+    # [fa2_sm70] Строка формата кэша: форматам *_per_token_head нужны масштабы fp32 на
+    # (позицию, kv-голову), и их память РЕЖЕТСЯ ИЗ ТОГО ЖЕ сырого буфера страницы (раскладку
+    # внутри страницы задаёт бэкенд через get_kv_cache_shape) — значит бюджетируется ЗДЕСЬ.
+    cache_dtype_str: str | None = None
 
     @property
     def page_size_bytes(self) -> int:
@@ -154,7 +158,12 @@ class AttentionSpec(KVCacheSpec):
         # Per-token-head scales are stored in separate tensors managed
         # by the attention backend, but the memory is carved from the
         # raw KV cache allocation so it must be budgeted here.
-        if self.kv_quant_mode.is_per_token_head:
+        # [fa2_sm70] Also honour cache_dtype_str (set by our attention layer) in case
+        # kv_quant_mode was not populated by the caller.
+        if self.kv_quant_mode.is_per_token_head or self.cache_dtype_str in (
+            "int8_per_token_head",
+            "fp8_per_token_head",
+        ):
             real_page_size += (
                 2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
             )
@@ -258,6 +267,7 @@ class FullAttentionSpec(AttentionSpec):
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
+            cache_dtype_str=specs[0].cache_dtype_str,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
         )
@@ -645,6 +655,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
+            cache_dtype_str=specs[0].cache_dtype_str,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
         )

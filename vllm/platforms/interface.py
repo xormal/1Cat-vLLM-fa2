@@ -643,12 +643,44 @@ class Platform:
             # TODO(tdoublep): this constraint can be relaxed fairly
             # easily by changing the way we layout chunks in the
             # mamba2 kernels.
+
+            # [FA2/SM70, задача 194] ГРАНУЛЯРНОСТЬ СОСТОЯНИЯ -- ОТДЕЛЬНАЯ ВЕЛИЧИНА.
+            # Страница mamba НЕ зависит от размера блока (это размер состояния), а память
+            # при 'all' равна cdiv(длина, блок) * страница. Значит, храня состояние РЕЖЕ,
+            # мы линейно уменьшаем число блоков, нужных рекуррентным слоям, -- и ёмкость
+            # растёт, хотя сжатия не было. Цена -- грубее гранулярность попадания в кэш
+            # (префикс должен совпасть до границы блока состояния).
+            # Множитель FA2SM70_MAMBA_BLK_MULT: 1 = как у авторов.
+            # (Перенесено из models/config.py HybridAttentionMambaModelConfig: у новых
+            # авторов расчёт блоков гибрида живёт здесь.)
+            import os as _os  # noqa: PLC0415
+
+            _blk_mult = max(1, int(_os.environ.get("FA2SM70_MAMBA_BLK_MULT", "1")))
             base_chunk_size = mamba_block_size or model_config.get_mamba_chunk_size()
             assert base_chunk_size is not None
             attn_tokens_per_mamba_state = cdiv(mamba_page_size, attn_page_size_1_token)
             chunk_size = lcm(base_chunk_size, kernel_block_alignment_size)
             attn_block_size = chunk_size * cdiv(attn_tokens_per_mamba_state, chunk_size)
-            cache_config.mamba_block_size = attn_block_size
+            cache_config.mamba_block_size = attn_block_size * _blk_mult
+            # [FA2/SM70 26.08] В РАЗДЕЛЬНОМ РЕЖИМЕ БЛОК ВНИМАНИЯ РАВЕН БЛОКУ СОСТОЯНИЯ.
+            # ОТКАЗ, КОТОРЫЙ ЭТО ЛЕЧИТ: в раздельном режиме число блоков ОБЩЕЕ для всех групп
+            # (kv_cache_utils, задача 194), а блок состояния при множителе K покрывает в K раз
+            # больше токенов, чем блок внимания. Значит на каждый блок внимания выделяется
+            # ЦЕЛЫЙ блок состояния, и (K-1)/K его объёма простаивает. Замер при K=2, пул 8 ГиБ:
+            # сумма страниц 80.8 МиБ на строку -> 101 блок -> ёмкость 206 848 токенов, тогда как
+            # по цене токена (30.7 КиБ) должно выходить ~273 000. Запрос на 240K при этом НЕ
+            # отклоняется, а ВСТАЁТ ЖДАТЬ блоков, которых не будет -- сервер выглядит зависшим.
+            # Сравняв блоки, простой убираем: строка покрывает K*2048 токенов у обеих групп.
+            # Цена -- гранулярность попадания префикс-кэша, но она и так равна НОК блоков,
+            # то есть блоку состояния; хуже не становится.
+            if _os.environ.get("FA2SM70_SPLIT_POOLS", "0") == "1" and _blk_mult > 1:
+                attn_block_size = cache_config.mamba_block_size
+                logger.info(
+                    "[fa2_sm70] РАЗДЕЛЬНЫЕ СТРАНИЦЫ: блок внимания поднят до блока "
+                    "состояния (%d токенов) -- иначе (K-1)/K каждого блока состояния "
+                    "простаивает",
+                    attn_block_size,
+                )
         else:
             # Without prefix caching, use minimum block size that satisfies
             # both backend alignment and mamba page size compatibility
@@ -673,6 +705,23 @@ class Platform:
         assert attn_page_size >= mamba_page_size
 
         if attn_page_size == mamba_page_size:
+            return
+
+        # [FA2/SM70, задача 194] В РАЗДЕЛЬНОМ РЕЖИМЕ ПАДДИНГ НЕ НУЖЕН И ВРЕДЕН.
+        # Он существует только чтобы страницы всех слоёв совпали в общем буфере. При
+        # FA2SM70_SPLIT_POOLS=1 буфер у каждого слоя свой (kv_cache_utils), и добивать
+        # страницу состояния до страницы внимания -- значит выбросить ровно ту память,
+        # ради которой всё делается (замерено: паддинг 147%, то есть 3/5 страницы
+        # состояния -- пустота). Импорт СВОЙ: ветка 'all' выше может не исполниться.
+        import os as _os  # noqa: PLC0415
+
+        if _os.environ.get("FA2SM70_SPLIT_POOLS", "0") == "1":
+            logger.info(
+                "[fa2_sm70] раздельные страницы: паддинг состояния до страницы внимания "
+                "СНЯТ (страница состояния %.2f МиБ против страницы внимания %.2f МиБ)",
+                mamba_page_size / 2**20,
+                attn_page_size / 2**20,
+            )
             return
 
         if (

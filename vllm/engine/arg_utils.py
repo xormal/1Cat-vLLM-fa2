@@ -1785,6 +1785,17 @@ class EngineArgs:
         if spec_method not in ("mtp", "dflash"):
             return
 
+        # [fa2_sm70 28.09] ПУТЬ FA2 (VLLM_SM70_FA2=1): УМОЛЧАНИЯ MTP -- БОЕВЫЕ, А НЕ 1Cat.
+        # Без этого голова MTP шла через FLASH_ATTN_V100, который не читает наш int8-KV
+        # (int8_per_token_head) и роняет движок на первом же черновике; а вероятностный
+        # черновик меняет семантику отбраковки против боевой (жадный черновик, отбраковка
+        # «один-в-один», проверено на боевом: draft_probs=None). Явно заданные ключи
+        # speculative-config по-прежнему главнее -- setdefault их не трогает.
+        if spec_method == "mtp" and envs.VLLM_SM70_FA2:
+            self.speculative_config.setdefault("attention_backend", "FA2_SM70")
+            self.speculative_config.setdefault("draft_sample_method", "greedy")
+            self.speculative_config.setdefault("use_local_argmax_reduction", False)
+
         if "draft_sample_method" not in self.speculative_config:
             # For SM70 native MTP, official Qwen sampling is non-greedy
             # (temperature=1.0/top_p=0.95/top_k=20). Probabilistic draft

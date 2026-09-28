@@ -60,6 +60,11 @@ def _maybe_sm70_dense_forward(
 ) -> torch.Tensor | None:
     if getattr(layer, "_sm70_f16_forbidden", False):
         return None
+    # [fa2_sm70 28.09] Вес слоя может быть снят сторонним путём квантования (наша int8-голова MTP
+    # освобождает плотный вес после подготовки): тогда быстрый плотный путь обязан отступить,
+    # а не звать ядро по None.
+    if getattr(layer, "weight", None) is None:
+        return None
     if not getattr(layer, "_sm70_f16_prepared", False):
         return None
     if not hasattr(torch.ops._C, "sm70_f16_gemm"):

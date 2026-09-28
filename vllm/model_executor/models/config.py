@@ -381,10 +381,49 @@ class MambaModelConfig(VerifyAndUpdateConfig):
                     "for prefix caching with Mamba cache 'all' mode: "
                     "falling back to 'align' mode."
                 )
+            # [FA2/SM70, задача 194] РЕЖИМ 'all' ВКЛЮЧАЕТСЯ РЫЧАГОМ, А НЕ САМ.
+            # Реализация есть (состояние GDN по границам блоков), но это РАЗМЕН: 'all'
+            # держит страницы под ВСЕ 64 слоя, а не под 16 слоёв внимания, и при том же пуле
+            # ёмкость контекста падает ~392K -> ~98K токенов. Для диалога это выгодно (кэш
+            # работает вместе со спекуляцией), для длинных промптов -- нет. Пока рычаг не
+            # выставлен, поведение боевого прежнее.
+            import os as _os
+            if (
+                cache_config.mamba_cache_mode == "all"
+                and _os.environ.get("FA2SM70_MAMBA_ALL", "0") != "1"
+            ):
+                cache_config.mamba_cache_mode = "align"
+                logger.warning(
+                    "[fa2_sm70] режим mamba-кэша 'all' СОБРАН, но выключен: "
+                    "включение -- FA2SM70_MAMBA_ALL=1 (цена -- ёмкость контекста)"
+                )
             if cache_config.mamba_cache_mode == "align":
                 assert vllm_config.scheduler_config.enable_chunked_prefill, (
                     "Chunked prefill is required for mamba cache mode 'align'."
                 )
+                # [FA2/SM70] ЗАПРЕТ align+СПЕКУЛЯЦИЯ: ПРОВЕРЕН ОПЫТОМ И ОСТАВЛЕН.
+                # Причина запрета у авторов: спекуляция уводит состояние mamba на k+1 токенов
+                # вперёд, и отклонённые токены оставляют в кэш-блоке испорченное состояние.
+                # 19.08 гипотеза «блок mamba 1568 токенов не пересекается спекуляцией на 4»
+                # ПРОВЕРЕНА ГЕЙТОМ ТОЖДЕСТВЕННОСТИ (один вход дважды, temperature=0) и
+                # ОПРОВЕРГНУТА: на 15K префиксе, где кэш реально сработал (x2.56), повторный
+                # ответ РАЗОШЁЛСЯ с первым. Порча ТИХАЯ -- начало текста совпадает. Короткие
+                # случаи и ветвление прошли, потому там кэш почти не работает.
+                # Рычаг FA2SM70_ALIGN_SPEC=1 оставлен ТОЛЬКО для повторного исследования.
+                # (Новые авторы запрет сняли и сами ставят 'align' при спекуляции -- их
+                # постобработка align+спекуляции на нашем пути гейтом НЕ проверена.)
+                import os as _os
+
+                if _os.environ.get("FA2SM70_ALIGN_SPEC", "0") != "1":
+                    assert not vllm_config.speculative_config, (
+                        "Mamba cache mode 'align' is currently not compatible "
+                        "with speculative decoding."
+                    )
+                elif vllm_config.speculative_config:
+                    logger.warning(
+                        "[fa2_sm70] align+спекуляция РАЗРЕШЕНЫ рычагом FA2SM70_ALIGN_SPEC=1 "
+                        "-- обязателен гейт тождественности повторного ответа"
+                    )
             logger.info_once(
                 "Prefix caching is enabled with Mamba cache '%s' mode.",
                 cache_config.mamba_cache_mode,

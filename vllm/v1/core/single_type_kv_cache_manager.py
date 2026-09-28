@@ -633,6 +633,10 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                 for computed in computed_blocks:
                     computed.pop()
         if use_eagle and computed_blocks[0]:
+            # [FA2/SM70] Здесь в старом upstream стоял `assert block_size == alignment_tokens`;
+            # у нас (блок окна черновика 2048, шаг = блок состояния GDN 16384 при
+            # FA2SM70_MAMBA_BLK_MULT=8) он ронял движок на первом запросе 32K. Мы сбрасывали
+            # alignment_tokens // block_size блоков; цикл ниже (upstream) делает то же самое.
             for computed in computed_blocks:
                 computed.pop()
             # Re-align after eagle pop: the pop may break the alignment
@@ -853,6 +857,8 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> None:
         super().__init__(kv_cache_spec, block_pool, **kwargs)
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+        # [FA2/SM70] Хэши блоков, ставших закэшированными В ТЕКУЩЕМ ШАГЕ. Состояние mamba для
+        # них ещё не записано, поэтому опираться на них другой заявке НЕЛЬЗЯ.
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         if self.mamba_cache_mode == "align":
@@ -964,6 +970,10 @@ class MambaManager(SingleTypeKVCacheManager):
             # To put it in the next step, we return num_gpu_blocks + 1 so
             # that kv_cache_manager will think there is no enough blocks to allocate now
             # and don't schedule it in the current step.
+            # Блок внимания закэширован уже сейчас, а рекуррентное состояние для него пишется
+            # только по итогам шага -- значит попадание на него означало бы чтение НЕЗАПИСАННОГО
+            # состояния. Возвращаем заведомо недостижимое число блоков: планировщик решит, что
+            # места нет, и возьмёт заявку СЛЕДУЮЩИМ шагом, когда состояние уже будет.
             return self.block_pool.num_gpu_blocks + 1
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for

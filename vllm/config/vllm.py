@@ -944,7 +944,11 @@ class VllmConfig:
                     "tree verification. Disable async scheduling or set "
                     "ddtree_disable_tree_verify=True for the flat DFlash path."
                 )
-            if self.speculative_config is not None:
+            # [FA2/SM70] Тот же вентиль, что и ниже: при FA2SM70_ASYNC_SCHED=1 охранные отказы
+            # снимаются. Нужно здесь ТОЖЕ, потому что конфигурация разбирается ДВАЖДЫ (второй раз
+            # флаг уже выставлен и берётся эта, строгая, ветка) -- на этом первый пуск и упал.
+            _fa2_async0 = os.environ.get("FA2SM70_ASYNC_SCHED", "0") == "1"
+            if self.speculative_config is not None and not _fa2_async0:
                 if (
                     self.speculative_config.method not in get_args(EagleModelTypes)
                     and self.speculative_config.method not in get_args(NgramGPUTypes)
@@ -955,7 +959,7 @@ class VllmConfig:
                         "with EAGLE/MTP/Draft Model/NGram GPU kind of "
                         "speculative decoding"
                     )
-                if self.speculative_config.disable_padded_drafter_batch:
+                if self.speculative_config.disable_padded_drafter_batch and not _fa2_async0:
                     raise ValueError(
                         "Async scheduling is not compatible with "
                         "disable_padded_drafter_batch=True."
@@ -966,6 +970,18 @@ class VllmConfig:
                 )
         elif self.scheduler_config.async_scheduling is None:
             # Enable async scheduling unless there is an incompatible option.
+            # [FA2/SM70 26.08] ДВЕ ОХРАННЫЕ ПРОВЕРКИ, ОБЕ КОНСЕРВАТИВНЫЕ, ОБЕ СНИМАЮТСЯ ВЕНТИЛЕМ.
+            # Асинхронное планирование прячет ХВОСТ ДВИЖКА (подготовка входа, метаданные, выборка,
+            # учёт -- около 4.7 мс на шаг по фазомеру) под работу карты. Выключено оно у нас
+            # ДВАЖДЫ: (1) метод спекуляции `dflash2` не входит в список eagle-подобных, хотя ведёт
+            # себя как они; (2) `mamba_cache_mode != none` объявлен несовместимым с ним целиком.
+            # Обе -- запреты «на всякий случай», а не следствие замеренного дефекта. Вентиль
+            # FA2SM70_ASYNC_SCHED=1 их снимает; умолчание НЕ МЕНЯЕТСЯ (файл общий с боевым).
+            # Проверять ОБЯЗАТЕЛЬНО приёмкой и иглой, а не только гейтом «17*23»: рассогласование
+            # состояния GDN между шагами -- порча тихая.
+            # (Порт на новый upstream: запрет по mamba-кэшу upstream снял сам; вентиль стоит
+            # ПОСЛЕ отказов pooling / dflash_ddtree, которые upstream добавил как настоящие.)
+            _fa2_async = os.environ.get("FA2SM70_ASYNC_SCHED", "0") == "1"
             if (
                 self.model_config is not None
                 and self.model_config.runner_type == "pooling"
@@ -984,6 +1000,10 @@ class VllmConfig:
                     "async path."
                 )
                 self.scheduler_config.async_scheduling = False
+            elif _fa2_async:
+                logger.info("[fa2_sm70] асинхронное планирование ВКЛЮЧЕНО вентилем "
+                            "(охранные проверки по методу спекуляции и mamba-кэшу сняты)")
+                self.scheduler_config.async_scheduling = True
             elif (
                 self.speculative_config is not None
                 and self.speculative_config.method not in get_args(EagleModelTypes)

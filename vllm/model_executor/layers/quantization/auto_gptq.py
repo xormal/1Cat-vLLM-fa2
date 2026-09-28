@@ -219,6 +219,22 @@ class AutoGPTQConfig(QuantizationConfig):
         modules_in_block_to_quantize = cls.get_from_keys_or(
             config, ["modules_in_block_to_quantize"], default=None
         )
+        # [fa2_sm70 28.09] ТИПЫ, КОТОРЫХ НЕТ В TYPE_MAP, -- В ПРЕЖНИЙ exllama-ПУТЬ, А НЕ В ОТКАЗ.
+        # Этот класс знает только симметричные uint4b8/uint8b128 (Marlin). Наш боевой слепок --
+        # GPTQ v1, 8 бит, sym=False (RTN, группа 128): на нём конструктор ниже бросает
+        # "Unsupported quantization config", и сервер не поднимается вовсе. Такие конфиги отдаём
+        # прежнему GPTQConfig (gptq.py: ops.gptq_gemm/gptq_shuffle, есть в _C), на который к тому
+        # же вешаются наши перехваты W8/TM8 (fa2sm70_w8.py подменяет GPTQLinearMethod.apply).
+        # Поддерживаемые Marlin-типы идут прежним путём upstream -- для них не меняется ничего.
+        if (weight_bits, is_sym) not in cls.TYPE_MAP:
+            from vllm.model_executor.layers.quantization.gptq import GPTQConfig
+
+            logger.info_once(
+                "GPTQ bits=%s sym=%s is not a Marlin type: using the exllama GPTQ path",
+                weight_bits,
+                is_sym,
+            )
+            return GPTQConfig.from_config(config)
         return cls(
             weight_bits,
             group_size,

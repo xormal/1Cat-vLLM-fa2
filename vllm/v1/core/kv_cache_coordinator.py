@@ -47,13 +47,31 @@ class KVCacheCoordinator(ABC):
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
 
-        self.block_pool = BlockPool(
+        # [FA2/SM70, задача 194] ПУЛ НА ГРУППУ (FA2SM70_SPLIT_POOLS=1).
+        # При раздельных страницах каждая группа живёт в СВОЁМ буфере, поэтому номера блоков
+        # у групп независимы: блок 7 группы внимания и блок 7 группы состояний -- разные
+        # области памяти. Общий пул тратил бы номера вчетверо (по одному на каждую группу),
+        # и вся экономия страниц пропала бы.
+        import os as _os
+        _n_groups = len(kv_cache_config.kv_cache_groups)
+        self.split_pools = (
+            _os.environ.get("FA2SM70_SPLIT_POOLS", "0") == "1" and _n_groups > 1
+        )
+        _mk = lambda: BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
             enable_caching=enable_caching,
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
         )
+        if self.split_pools:
+            self.block_pools = [_mk() for _ in range(_n_groups)]
+        else:
+            _one = _mk()
+            self.block_pools = [_one] * max(1, _n_groups)
+        # Совместимость: одиночное имя оставлено -- на него смотрят метрики, события и наш
+        # непрерывный хвост. В раздельном режиме это пул ПЕРВОЙ группы (внимание).
+        self.block_pool = self.block_pools[0]
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
@@ -68,7 +86,7 @@ class KVCacheCoordinator(ABC):
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_num_batched_tokens=max_num_batched_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
+                block_pool=self.block_pools[i],
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
@@ -110,12 +128,15 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
+        # В раздельном режиме считаем ПО ГРУППАМ (см. has_free_blocks_for): сумма по разным
+        # пулам бессмысленна -- у каждого свой запас.
+        per_group: list[int] = [0] * len(self.single_type_managers)
         num_blocks_to_allocate = 0
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                _n = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -123,8 +144,10 @@ class KVCacheCoordinator(ABC):
                     num_encoder_tokens,
                     apply_admission_cap=apply_admission_cap,
                 )
+                per_group[i] += _n
+                num_blocks_to_allocate += _n
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                _n = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],
@@ -132,7 +155,24 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                 )
+                per_group[i] += _n
+                num_blocks_to_allocate += _n
+        self._last_per_group = per_group
         return num_blocks_to_allocate
+
+    def has_free_blocks_for(self, per_group: list[int] | None = None) -> bool:
+        """Хватает ли места ПОД КАЖДУЮ группу в её собственном пуле."""
+        per_group = per_group if per_group is not None else getattr(
+            self, "_last_per_group", None
+        )
+        if per_group is None:
+            return True
+        if not self.split_pools:
+            return sum(per_group) <= self.block_pool.get_num_free_blocks()
+        return all(
+            n <= pool.get_num_free_blocks()
+            for n, pool in zip(per_group, self.block_pools)
+        )
 
     def allocate_new_computed_blocks(
         self,
@@ -545,6 +585,27 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # per candidate length (see issue #32802).
         eagle_verified: set[int] = set()
 
+        # [FA2/SM70 25.08] СКРУТКА В НОЛЬ ПРИ СПЕКУЛЯЦИИ -- ЗАКРЫТА.
+        # `use_eagle` укорачивает попадание на блок (черновику нужен токен ЗА префиксом). Но
+        # раньше это делалось НА КАЖДОЙ ИТЕРАЦИИ фиксированной точки: пока длина падает, цикл
+        # повторяется, и каждая итерация роняет ещё блок -- у модели с ТРЕМЯ описаниями групп
+        # (полное внимание цели, скользящее окно черновика, GDN) длина скручивается в НОЛЬ.
+        # Замерено: попаданий 0 из 24192 против 12288 у базы; до первого токена 4.29 с против 1.19.
+        # Ровно этот дефект помечен FIXME выше (issue 32802) как «EAGLE spiral block dropping».
+        # Ронять положено ОДИН раз: дальше длину уже уменьшают сами группы своим минимумом.
+        # [FA2/SM70 12.09] СБРОС БЛОКА ПРИ СПЕКУЛЯЦИИ -- ПОД РЫЧАГОМ FA2SM70_EAGLE_SBROS (1 = как было).
+        # Зачем сброс вообще: KV черновика в позиции i зависит от токена i+1 (вход черновика --
+        # пара «токен i+1, скрытое состояние i»), а хэш блока токен за границей не покрывает.
+        # Значит при попадании до kv0 ОДНА позиция kv0-1 у черновика устарела, если продолжение
+        # другое. Цена лечения сбросом -- ЦЕЛЫЙ блок состояния (16384 токенов) на каждый
+        # повторный вопрос: на 251K это 22 206 токенов перепрефилла вместо 5 822 (замер 12.09:
+        # 39-41 с на каждый из 11 вопросов при 276.8 с первого). Точность выхода от черновика
+        # не зависит (цель проверяет каждый токен), страдает лишь приёмка на <=2048 токенах окна.
+        # При 0 сброса нет; сверять приёмкой (SpecDecoding metrics) и временем повторного вопроса.
+        # (Порт на новый upstream: спираль upstream закрыл сам -- eagle_verified + поиск на блок
+        # дальше с последующим снятием, issue #32802. Здесь остаётся только рычаг сброса.)
+        import os as _os_e
+        _eagle_sbros = _os_e.environ.get("FA2SM70_EAGLE_SBROS", "1") != "0"
         while True:
             curr_hit_length = hit_length
 
@@ -560,7 +621,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     continue
 
                 use_eagle = (
-                    idx in self.eagle_attn_group_indices and idx not in eagle_verified
+                    _eagle_sbros
+                    and idx in self.eagle_attn_group_indices
+                    and idx not in eagle_verified
                 )
 
                 _max_length = curr_hit_length
@@ -569,24 +632,47 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     _max_length = min(
                         curr_hit_length + spec.block_size, max_cache_hit_length
                     )
-                hit_blocks = manager_cls.find_longest_cache_hit(
-                    block_hashes=_get_block_hashes(spec),
-                    max_length=_max_length,
-                    kv_cache_group_ids=group_ids,
-                    block_pool=self.block_pool,
-                    kv_cache_spec=spec,
-                    use_eagle=use_eagle,
-                    alignment_tokens=self.lcm_block_size,
-                )
-                _new_hit_length = len(hit_blocks[0]) * spec.block_size
+                # [FA2/SM70] ПОИСК ПОПАДАНИЯ -- ПО КАЖДОЙ ГРУППЕ ОТДЕЛЬНО.
+                # Здесь группы с ОДИНАКОВЫМ описанием искались ОДНИМ вызовом, и один
+                # результат раздавался всем: это верно, пока они делят общий пул. При
+                # раздельных пулах блоки соседней группы лежат в ДРУГОМ буфере, и
+                # раздача чужих объектов означала бы чтение чужой памяти. Поэтому
+                # спрашиваем каждый пул сам за себя и берём ОБЩУЮ (минимальную) длину --
+                # состояние восстановимо лишь там, где попали ВСЕ группы.
+                _split = getattr(self, "split_pools", False)
+                _batches = [[g] for g in group_ids] if _split else [group_ids]
+                _min_len = None
+                for _gids in _batches:
+                    hit_blocks = manager_cls.find_longest_cache_hit(
+                        block_hashes=_get_block_hashes(spec),
+                        max_length=_max_length,
+                        kv_cache_group_ids=_gids,
+                        block_pool=self.block_pools[_gids[0]],
+                        kv_cache_spec=spec,
+                        use_eagle=use_eagle,
+                        alignment_tokens=self.lcm_block_size,
+                    )
+                    _len = len(hit_blocks[0]) * spec.block_size
+                    _min_len = _len if _min_len is None else min(_min_len, _len)
+                    for group_id, blocks in zip(_gids, hit_blocks):
+                        hit_blocks_by_group[group_id] = blocks
+                _new_hit_length = _min_len if _min_len is not None else 0
                 if use_eagle:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
                     # length shrunk; invalidate previous eagle verifications
                     eagle_verified.clear()
                 curr_hit_length = _new_hit_length
-                for group_id, blocks in zip(group_ids, hit_blocks):
-                    hit_blocks_by_group[group_id] = blocks
+                import os as _o
+                if int(_o.environ.get("FA2SM70_KESH_DEBUG", "0")) and getattr(
+                    self, "_дозор_кэша", 0
+                ) < int(_o.environ.get("FA2SM70_KESH_DEBUG", "0")):
+                    print(
+                        f"[кэш] {type(spec).__name__} (блок {spec.block_size}, групп "
+                        f"{len(group_ids)}): попадание {_min_len} токенов "
+                        f"(вход {max_cache_hit_length}, текущее {curr_hit_length})",
+                        flush=True,
+                    )
 
             if curr_hit_length >= hit_length:
                 break
@@ -602,6 +688,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 if (blks := hit_blocks_by_group[group_id]) is not None:
                     del blks[num_blocks:]
 
+        import os as _o2
+        if int(_o2.environ.get("FA2SM70_KESH_DEBUG", "0")):
+            self._дозор_кэша = getattr(self, "_дозор_кэша", 0) + 1
+            if self._дозор_кэша <= int(_o2.environ.get("FA2SM70_KESH_DEBUG", "0")):
+                print(f"[кэш] ИТОГ: {hit_length} из {max_cache_hit_length}", flush=True)
         return tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         ), hit_length

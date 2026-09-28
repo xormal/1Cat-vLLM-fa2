@@ -949,6 +949,10 @@ def _resolve_rust_frontend_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # [FA2/SM70, задача 180] Подмена рекуррентного шага GDN в декоде (fa2_gdn_shim). Вызов
+    # запекается torch.compile в скомпилированный код -- без этой строки компил-кэш не
+    # различает REC=0/1 и подмена молча не участвует (тот же класс мины, что и выше).
+    "FA2SM70_GDN_REC": lambda: os.getenv("FA2SM70_GDN_REC", "0"),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
@@ -1881,6 +1885,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Put our own sm_70 backend (FA2_SM70) first in the priority list. Off by default: turning it on
     # is a decision, and a silent default would make an A/B meaningless.
+    # [fa2_sm70] ОБЪЯВЛЕНИЕ -- НЕ КОСМЕТИКА: compile_factors() берёт «все известные» переменные,
+    # и без этой записи хэш компил-кэша НЕ РАЗЛИЧАЛ бэкенды, а графы у них разные
+    # (forward_includes_kv_cache_update) -- кэш от одного бэкенда рушил подъём другого
+    # (IndexError в copy_misaligned_inputs на profile_run, 18.08.2026). [28.09] Была и вторая,
+    # строковая запись того же ключа выше; в словаре побеждала эта -- оставлена одна.
     "VLLM_SM70_FA2": lambda: bool(int(os.getenv("VLLM_SM70_FA2", "0"))),
     "VLLM_SM70_PROFILE_TRACE": lambda: bool(
         int(os.getenv("VLLM_SM70_PROFILE_TRACE", "0"))

@@ -488,6 +488,7 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # Начало шага: сбросить учёт блоков, закэшированных в предыдущем шаге.
         self.kv_cache_manager.new_step_starts()
 
         # First, schedule the RUNNING requests.

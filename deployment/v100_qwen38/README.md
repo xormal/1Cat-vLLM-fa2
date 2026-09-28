@@ -21,6 +21,10 @@ quality claim by a gate that can be re-run from `tools/` of the kernel repo
 | `FA2SM70_W8_OOM_RETRY` | 1 | an allocator shortage returns the cache and retries instead of killing the worker |
 | `FA2SM70_MTP_NGRAM` | 1 | context n-grams as the draft source; neutral on prose, large on copying |
 | `FA2SM70_CG` | 1 | full CUDA graph for decode |
+| `FA2SM70_TOPKP_FAST` | 1 | top-k/top-p without two full sorts of the 248 320 vocabulary per step; same tie order as the reference, 0 of 10 563 live rows differ |
+| `FA2SM70_MTP_NGRAM_FIX` | 1 | per-source running acceptance with search/explore modes; the old rule got stuck on one source |
+| `FA2SM70_TM8_RECON_OUT` | 1 | the reconstructed body writes `torch.mm` straight into the output slice (`out=`), no extra copy |
+| `BOEVAYA_SET` | `abl` / `cyber` | which checkpoint the launcher serves; each has its own w12 store and compile cache, so switching back is one variable |
 
 ## Measured on production hardware
 

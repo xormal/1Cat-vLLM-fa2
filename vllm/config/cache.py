@@ -29,6 +29,7 @@ CacheDType = Literal[
     "turboquant_4bit_nc",
     "turboquant_k3v4_nc",
     "turboquant_3bit_nc",
+    # [fa2_sm70] int8 + масштаб fp32 на (позицию, kv-голову) — формат бэкенда FA2_SM70
     "int8_per_token_head",
     "fp8_per_token_head",
     "nvfp4",

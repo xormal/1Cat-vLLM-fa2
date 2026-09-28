@@ -74,6 +74,136 @@ from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
+# ---- [FA2/SM70] перенесено из прежнего vllm/v1/spec_decode/eagle.py (SpecDecodeBaseProposer
+# ---- переехал сюда в новом upstream). Всё ниже мертво при снятых рычагах FA2SM70_*.
+import os as _os  # noqa: E402
+import torch as _torch  # noqa: E402
+
+# Проба потолка дерева: печатать раз в N шагов; 0 = ветка мертва (см. §234).
+_ПРОБА_ТОП2 = int(__import__("os").environ.get("FA2SM70_MTP_TOP2", "0"))
+# Сбор скрытых состояний черновика для проверки двухступенчатого аргмакса (0 = ветка мертва).
+_СБОР_СКРЫТЫХ = int(__import__("os").environ.get("FA2SM70_MTP_DUMP_H", "0"))
+# Двухступенчатый аргмакс словаря черновика: 0 = ветка мертва, боевой путь не меняется.
+_И4 = int(__import__("os").environ.get("FA2SM70_MTP_I4", "0"))
+_И4_СПИСОК = int(__import__("os").environ.get("FA2SM70_MTP_I4_N", "16"))
+_И4_MMAX = int(__import__("os").environ.get("FA2SM70_MTP_I4_MMAX", "2"))
+# [СРЕЗ ИЗМЕРЕНИЙ У ПЕРВОЙ СТУПЕНИ -- 09.09, записка 25 §253]
+# Полный int4-словарь (303 МиБ) не уживается с 262 144 токенами -- проверено семью путями.
+# Но первой ступени не нужен точный счёт: ей нужно, чтобы верная строка ПОПАЛА В СПИСОК, а
+# вторая ступень пересчитает список точно по полному весу. Значит можно упаковать СРЕЗ первых
+# r измерений. Ядро i4 берёт K во время исполнения -- новой сборки не нужно.
+# Полнота на 700 НАСТОЯЩИХ скрытых состояниях черновика (доля ранга, 124160 строк):
+#   r=2048 (121 МиБ) top64= 97.6 %      r=3072 (182 МиБ) top64=100.0 %
+#   r=2560 (152 МиБ) top64= 99.9 %      r=4096 (243 МиБ) top16=100.0 %
+# Случайная проекция той же памяти ХУЖЕ среза (r=2048: 82.9 против 97.6) -- энергия скрытого
+# состояния лежит в исходных координатах, а не размазана.
+# 0 = без среза (прежнее поведение, весь K).
+_И4_СРЕЗ = int(__import__("os").environ.get("FA2SM70_MTP_I4_R", "0"))
+# [СВОЙ ГРАФ ТЕЛА ЧЕРНОВИКА -- 09.09, записка 25 §257]
+# Проход черновика идёт PIECEWISE (vLLM даёт ему только его, eagle.py:289). Замер: карта
+# 7.06 мс при ядрах ~4.3, выдача хозяином 6.85 -- то есть щель ~2.2 мс и она вся в ленивой
+# выдаче. Здесь тело головы захватывается в СВОЙ граф по образцу dflash2 (§212): входы уже
+# живут в постоянных буферах, у меты держатся четыре тензора и копируются свежие значения.
+# БЕЗОПАСНОСТЬ: любой отказ хоронит ключ навсегда и путь возвращается к прежнему; а ошибка
+# черновика в принципе не может испортить выход -- цель проверяет каждый токен.
+_ГР_ЧЕРН = __import__("os").environ.get("FA2SM70_MTP_GRAPH", "0") == "1"
+_ГР_ЧЕРН_ФАЙЛ = __import__("os").environ.get("FA2SM70_MTP_GRAPH_FILE", "")
+# Длина контекста входит в ключ ВЕДРОМ: выбор пути внутри бэкенда зависит от max_seq_len,
+# и запекать его без ведра значило бы переиграть чужой путь на выросшем контексте.
+_ГР_ЧЕРН_ВЕДРО = int(__import__("os").environ.get("FA2SM70_MTP_GRAPH_BUCKET", "16384"))
+# Подняты из тела `_i4_argmax`: там они выполнялись на КАЖДОМ вызове (три за шаг).
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size as _tp_size,
+)
+from vllm.distributed.communication_op import (
+    tensor_model_parallel_all_gather,
+)
+# Тумблер местного аргмакса черновика (§250). Пустой путь = ветка мертва.
+_МЕСТ_ФАЙЛ = __import__("os").environ.get("FA2SM70_MTP_LOCALARGMAX_FILE", "")
+# Окна на событиях зовутся ШЕСТЬ раз за шаг -- признак читается один раз, при загрузке.
+_ФАЗА_ДЕВ = int(__import__("os").environ.get("FA2SM70_STEP_PHASE_DEV", "0"))
+_ФАЗА_N = int(__import__("os").environ.get("FA2SM70_STEP_PHASE", "0"))
+import time as _t_eagle
+
+
+# [ЗАКРЕПЛЁННАЯ ПЛОЩАДКА ДЛЯ H2D -- 11.09, записка 25 §291]
+# Трасса 11.09 (стенд, декод): 68 синхронных копий хозяин->карта на ~17 шагов, то есть 4 на шаг.
+# Причина: `torch.tensor(список, device=cuda)` и `.to(device, non_blocking=True)` по ВЫЧИСЛЕННОМУ
+# (а значит НЕ закреплённому) CPU-тензору. На непиннованной памяти `non_blocking` молча
+# игнорируется, копия идёт синхронно и РВЁТ КОНВЕЙЕР: карта доезжает до конца очереди, хозяин
+# продолжает только после. Собственно копия стоит микросекунды, платит простой.
+# Лечение: постоянные пары (закреплённый CPU-буфер, буфер карты) на каждое поле, копия
+# non_blocking в тот же буфер. Адреса стабильны -- значит законно и внутри графа.
+# Умолчание 0: venv общий с боевым.
+_ЗАКРЕП = _os.environ.get("FA2SM70_PIN_HOST", "0") == "1"
+_ЗАКРЕП_БУФ: dict = {}
+
+
+def _закреп(имя, знач, устр):
+    """CPU-тензор -> карта через постоянную закреплённую площадку. Возвращает вид буфера карты.
+
+    `знач` -- одномерный CPU-тензор или numpy-массив. При отказе (нет pin_memory) возвращает
+    обычный перенос: ускорение не обязано быть условием работы.
+    """
+    try:
+        import numpy as _np
+        if isinstance(знач, _np.ndarray):
+            знач = _torch.from_numpy(знач)
+        n = знач.numel()
+        ключ = (имя, знач.dtype, str(устр))
+        пара = _ЗАКРЕП_БУФ.get(ключ)
+        if пара is None or пара[0].numel() < n:
+            м = max(n, 128)
+            cpu = _torch.empty(м, dtype=знач.dtype, pin_memory=True)
+            gpu = _torch.empty(м, dtype=знач.dtype, device=устр)
+            пара = (cpu, gpu)
+            _ЗАКРЕП_БУФ[ключ] = пара
+        cpu, gpu = пара
+        cpu[:n].copy_(знач)                      # хозяин -> хозяин, без синхронизации
+        gpu[:n].copy_(cpu[:n], non_blocking=True)  # закреплённая -> карта, асинхронно
+        return gpu[:n]
+    except Exception:
+        return знач.to(устр)
+
+
+# [ГЕЙТ ДЛЯ БУДУЩЕГО ОБУЧЕНИЯ ГОЛОВЫ MTP -- 11.09]
+# Прошлые четыре захода обучения черновика сгорели на ПРИБОРЕ: он не воспроизводил боевое число,
+# и дни уходили на оптимизацию не той функции (записка 25, урок «прибор врёт про разность»).
+# Поэтому порядок здесь обратный: сперва гейт, потом обучение. Гейт возможен только если снять
+# ТРОЙКУ за один шаг: (признаки цели, токены входа, токен, который движок выдал САМ). Тогда
+# офлайновый проход головы обязан совпасть с движком ПОБАЙТОВО на тех же буферах -- и лишь после
+# этого его разность между моделями можно считать осмысленной.
+# Умолчание пусто: venv общий с боевым, и в выключенном виде это одна проверка строки на вызов.
+_ГЕЙТ_ДАМП = _os.environ.get("FA2SM70_MTP_GATE_DUMP", "")
+_ГЕЙТ_N = [0]
+_ГЕЙТ_МАКС = int(_os.environ.get("FA2SM70_MTP_GATE_MAX", "200"))
+
+
+def _снять_gejt(признаки, входные, токены):
+    """Кладёт (признаки, входные токены, выданные черновиком токены) одного шага на диск."""
+    if _ГЕЙТ_N[0] >= _ГЕЙТ_МАКС:
+        return
+    try:
+        _os.makedirs(_ГЕЙТ_ДАМП, exist_ok=True)
+        n = _ГЕЙТ_N[0]; _ГЕЙТ_N[0] = n + 1
+        _torch.save({"h": признаки.detach().to(_torch.float16).cpu(),
+                     "vh": входные.detach().to(_torch.int32).cpu() if входные is not None else None,
+                     "dr": токены.detach().to(_torch.int32).cpu()},
+                    _os.path.join(_ГЕЙТ_ДАМП, f"shag_{_os.getpid()}_{n:05d}.pt"))
+    except Exception:
+        pass          # гейт -- прибор, а не условие работы
+
+
+def _хф(runner, имя, т0):
+    """ХОЗЯЙСКАЯ фаза внутри прохода черновика (записка 25 §256). Карта в проходе черновика
+    занята 7.35 мс, а хозяин выдаёт 7.12 -- то есть выдача и есть узкое место, и надо знать,
+    что именно в ней питон, а что запуски ядер."""
+    if _ФАЗА_N and runner is not None:
+        ф = getattr(runner, "_фаза_шага", None)
+        if ф is not None:
+            ф("  чер/х: " + имя, _t_eagle.perf_counter() - т0)
+
+
 
 def _sm70_mtp_profile_env_enabled() -> bool:
     return envs.VLLM_SM70_MTP_PROFILE
@@ -178,6 +308,8 @@ class SpecDecodeBaseProposer:
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
+        # [FA2/SM70] раннер нужен n-граммам MTP (ngram_iz_konteksta) и фазомеру (_хф/_карта).
+        self.runner = runner
 
         self.device = device
         self.dtype = vllm_config.model_config.dtype
@@ -594,7 +726,255 @@ class SpecDecodeBaseProposer:
             return self.model.get_top_tokens(hidden_states, spec_step_idx=spec_step_idx)
         return self.model.get_top_tokens(hidden_states)
 
+    # [ДВУХСТУПЕНЧАТЫЙ АРГМАКС СЛОВАРЯ ЧЕРНОВИКА -- 09.09, записка 25 §238-§240]
+    # Черновик MTP идёт цепью и на КАЖДОМ шаге проецирует скрытое в весь словарь: 1.27 ГБ на
+    # ранг, 1.93 мс. Но ему нужен не логит, а АРГМАКС. Здесь первый этап считается по int4
+    # (303 МиБ), берётся top-16, и он досчитывается ТОЧНО по fp16-строкам. Совпадение с точным
+    # аргмаксом 99.86 % на 700 настоящих состояниях; расхождение безвредно -- цель проверяет
+    # каждый черновой токен, цена в приёмке доли процента.
+    # ПУТЬ ВЫБИРАЕТСЯ ПО M: наше ядро скалярное и выигрывает при M<=2 (x3.00 при M=1),
+    # а при M=4 чужой torch идёт тензорным и быстрее -- отдаём ему.
+    def _i4_подготовить(self):
+        if getattr(self, "_i4_пак", None) is not None:
+            return self._i4_пак
+        if torch.cuda.is_current_stream_capturing():
+            return None            # ленивое выделение внутри ЗАХВАТА -- закон, ловилось трижды
+        try:
+            import fa2_sm70._ext as _E
+            W = self.model.lm_head.weight
+            if W.dtype != torch.float16 or W.dim() != 2 or W.shape[1] % 8:
+                raise ValueError(f"голова не годится: {tuple(W.shape)} {W.dtype}")
+            _r = W.shape[1] if not _И4_СРЕЗ else min(_И4_СРЕЗ, W.shape[1])
+            if _r % 8:
+                raise ValueError(f"срез r={_r} не кратен 8")
+            _ext = _E.i4_ext()
+            # УПАКОВКА КУСКАМИ СТРОК. Сама таблица мала (182 МиБ при r=3072), но `W[:, :r]`
+            # одним куском требует 728 МиБ ВРЕМЕННО -- и именно на этом подготовка отказала.
+            # Кусок в 8192 строки держит пик на ~48 МиБ. Раскладка построчная, поэтому куски
+            # складываются в готовый буфер без склейки.
+            _куc = int(__import__("os").environ.get("FA2SM70_MTP_I4_CHUNK", "8192"))
+            if _r == W.shape[1] and _куc >= W.shape[0]:
+                Q, S = _ext.pack(W.contiguous())
+            else:
+                Q = S = None
+                for _i in range(0, W.shape[0], _куc):
+                    _q, _s = _ext.pack(W[_i:_i + _куc, :_r].contiguous())
+                    if Q is None:
+                        Q = torch.empty((W.shape[0],) + tuple(_q.shape[1:]),
+                                        dtype=_q.dtype, device=_q.device)
+                        S = torch.empty((W.shape[0],) + tuple(_s.shape[1:]),
+                                        dtype=_s.dtype, device=_s.device)
+                    Q[_i:_i + _q.shape[0]] = _q
+                    S[_i:_i + _s.shape[0]] = _s
+                    del _q, _s
+                torch.cuda.empty_cache()
+            self._i4_пак = (Q, S, _ext, _r)
+            print(f"[MTP i4] словарь черновика упакован: {tuple(Q.shape)} "
+                  f"({Q.numel() / 2**20:.0f} МиБ против {W.numel()*2/2**20:.0f}, "
+                  f"срез r={_r} из {W.shape[1]})",
+                  file=__import__("sys").stderr, flush=True)
+        except Exception as _е:
+            self._i4_пак = None
+            globals()["_И4"] = 0
+            print(f"[MTP i4] отказ подготовки: {_е} -- иду прежним путём",
+                  file=__import__("sys").stderr, flush=True)
+        return self._i4_пак
+
+    def _i4_argmax(self, hidden_states: torch.Tensor):
+        пак = self._i4_подготовить()
+        if пак is None:
+            return None
+        Q, S, ext, _r = пак
+        h = hidden_states.to(torch.float16)
+        W = self.model.lm_head.weight
+        # ПЕРВАЯ ступень -- по срезу (дешёвое чтение), ВТОРАЯ -- по полному весу.
+        _hs = h[:, :_r].contiguous() if _r != h.shape[1] else h.contiguous()
+        топ = ext.scores(_hs, Q, S).topk(_И4_СПИСОК, dim=-1).indices        # [M, N]
+        h = h.contiguous()
+        # [ПИТОН В ПУТИ -- 09.09, записка 25 §256] Здесь стоял `torch.einsum("mk,mnk->mn")`.
+        # einsum РАЗБИРАЕТ формулу строкой при каждом вызове, а вызовов три за шаг; замер
+        # хозяйской фазы дал 1.35 мс выдачи против 1.61 мс работы карты на те же три вызова.
+        # `bmm` даёт ровно то же произведение без разбора формулы.
+        оц = torch.bmm(W[топ].float(), h.float().unsqueeze(-1)).squeeze(-1)  # точная досчитка
+        лок_зн, лок_поз = оц.max(dim=-1)
+        лок_идx = топ.gather(1, лок_поз.unsqueeze(1)).squeeze(1)
+        нач = self.model.lm_head.shard_indices.org_vocab_start_index
+        глоб = лок_идx + нач
+        tp = _tp_size()
+        if tp == 1:
+            return глоб.to(torch.int64)
+        пара = torch.stack([лок_зн.float(), глоб.float()], dim=-1)
+        соб = tensor_model_parallel_all_gather(пара, dim=-1).view(h.shape[0], tp, 2)
+        лучш = соб[:, :, 0].argmax(dim=-1, keepdim=True)
+        return соб[:, :, 1].gather(dim=-1, index=лучш).squeeze(-1).to(torch.int64)
+
+    # [РАЗБОР ПРОХОДА ЧЕРНОВИКА ПО КАРТЕ -- 09.09, записка 25 §249]
+    # Карта в проходе черновика занята 10.3 мс, хозяин выдаёт за 8.4 -- значит проход
+    # ограничен РАБОТОЙ, а не запусками, и полный граф черновика приза не имеет. Остаётся
+    # назвать, чем карта занята: тело головы (fc + один слой) или голова словаря (1.27 ГБ
+    # на ранг на КАЖДЫЙ из трёх проходов). Окна берут время СОБЫТИЯМИ, включаются тем же
+    # FA2SM70_STEP_PHASE_DEV=1 и при выключенном рычаге стоят ноль.
+    def _дополнить_мету(self, cad, реальных: int, всего: int):
+        """Метаданные на ДОПОЛНЕННУЮ форму: `всего` запросов по одной строке.
+
+        ЗАЧЕМ. Движок дополняет размер прохода черновика с `реальных` до `всего` (округление
+        размеров захвата под q=k+1 цели, §256), и тогда метаданные описывают одну строку, а
+        вход -- четыре. Однородный путь внимания такое рассогласование законно отвергает, и
+        свой граф захватить нельзя (§257). Тело при этом трогать НЕЛЬЗЯ: оно скомпилировано
+        под форму 4, а движок стоит с `evaluate_guards: False` -- вызов с другой формой падает
+        на `assert_size_stride` даже вне захвата (проверено).
+        Выход -- согласовать вторую сторону: объявить `всего` запросов по одной строке.
+        Настоящие идут первыми и не меняются НИ НА БИТ; добавочные получают длину 1 и слот
+        PADDING_SLOT_ID -- они ничего не пишут в кэш, а их выход отбрасывается вызывающим.
+        Буферы постоянные: иначе граф запёк бы адреса разовых тензоров.
+        """
+        import dataclasses as _dc
+        б = getattr(self, "_доп_буф", None)
+        if б is None or б["всего"] != всего or б["блоков"] != cad.block_table_tensor.shape[1]:
+            _у = cad.seq_lens.device
+            б = self._доп_буф = {
+                "всего": всего,
+                "блоков": cad.block_table_tensor.shape[1],
+                "qsl": torch.arange(всего + 1, device=_у, dtype=torch.int32),
+                "qsl_cpu": torch.arange(всего + 1, dtype=torch.int32),
+                "seq": torch.ones(всего, device=_у, dtype=cad.seq_lens.dtype),
+                "seq_cpu": torch.ones(всего, dtype=torch.int32),
+                "bt": torch.zeros((всего, cad.block_table_tensor.shape[1]),
+                                  device=_у, dtype=cad.block_table_tensor.dtype),
+                "sl": torch.full((всего,), PADDING_SLOT_ID, device=_у,
+                                 dtype=cad.slot_mapping.dtype),
+            }
+        б["seq"][:реальных].copy_(cad.seq_lens[:реальных], non_blocking=True)
+        б["bt"][:реальных].copy_(cad.block_table_tensor[:реальных], non_blocking=True)
+        б["sl"][:реальных].copy_(cad.slot_mapping[:реальных], non_blocking=True)
+        # Хвост (длина 1, слот-заглушка, нулевая строка таблицы) заведён при создании буферов
+        # и неизменен -- переписывать его каждый проход значило бы два лишних пуска ядер.
+        # [КЕШ ОБЪЕКТА ОТМЕНЁН ЗАМЕРОМ -- 09.09] Кешировать результат `replace` и править у него
+        # только `max_seq_len` выглядело даровой экономией 0.41 мс. Приёмка сказала иначе:
+        # с кешем tau дважды просела 2.45 -> 2.19 (-10 %), без кеша держится 2.43-2.47.
+        # Значит объект несёт поле, меняющееся ПОМИМО тех, что мы обновляем, и заморозка его
+        # портит черновик. Пересобираем каждый вызов -- цена честнее ошибки.
+        return _dc.replace(
+            cad,
+            query_start_loc=б["qsl"], query_start_loc_cpu=б["qsl_cpu"],
+            seq_lens=б["seq"], num_reqs=всего, num_actual_tokens=всего,
+            max_query_len=1, max_seq_len=int(cad.max_seq_len),
+            block_table_tensor=б["bt"], slot_mapping=б["sl"],
+            _seq_lens_cpu=None, _num_computed_tokens_cpu=None,
+        )
+
+    _ГР_ПОЛЯ = ("query_start_loc", "seq_lens", "block_table", "slot_mapping")
+
+    def _тело_графом(self, мета, входных, cad, model_kwargs, шаг, по_слоям=None):
+        """Проход тела головы одним CUDA-графом; None означает «иди обычным путём»."""
+        if not _ГР_ЧЕРН:
+            return None
+        # [порт] Новый upstream строит мету ПО ГРУППАМ внимания черновика; обновление
+        # буферов графа ниже знает только одну мету -- при нескольких группах не рискуем.
+        if len(self.draft_attn_groups) != 1:
+            return None
+        if _ГР_ЧЕРН_ФАЙЛ:
+            self._гр_черед = getattr(self, "_гр_черед", 0) + 1
+            if self._гр_черед % 64 == 1:
+                try:
+                    with open(_ГР_ЧЕРН_ФАЙЛ) as _ф:
+                        self._гр_вкл = _ф.read(1) == "1"
+                except OSError:
+                    self._гр_вкл = True
+            if not getattr(self, "_гр_вкл", True):
+                return None
+        _мсл = int(getattr(мета, "max_seq_len", 0) or 0)
+        ключ = (int(входных), int(getattr(мета, "num_reqs", 0)),
+                int(getattr(мета, "max_query_len", 0)), bool(getattr(мета, "causal", True)),
+                int(шаг), _мсл // max(_ГР_ЧЕРН_ВЕДРО, 1))
+        гр = getattr(self, "_гр_тела", None)
+        if гр is None:
+            гр = self._гр_тела = {}
+        з = гр.setdefault(ключ, {"счёт": 0, "мёртв": False})
+        if з["мёртв"]:
+            return None
+        if "граф" not in з:
+            з["счёт"] += 1
+            if з["счёт"] < 4:
+                # ПРОГРЕВ ИДЁТ НАСТОЯЩЕЙ ФОРМОЙ, а не дополненной. dynamo специализируется на
+                # ПЕРВОЙ увиденной форме и объявляет размерность динамической только увидев
+                # вторую; тело черновика видело лишь дополненную 4, и захват падал на
+                # `assert_size_stride: expected size 4==1`. Здесь оно видит и 1 -- если это и
+                # была причина, размерность станет динамической сама. Отказ ловится ниже и
+                # хоронит ключ, как всякий другой.
+                try:
+                    _по_слоям = по_слоям if по_слоям is not None else {
+                        имя: мета for имя in self._draft_attn_layer_names}
+                    _слоты = self._get_slot_mapping(входных, cad.slot_mapping)
+                    with set_forward_context(
+                        _по_слоям, self.vllm_config, num_tokens=входных,
+                        num_tokens_across_dp=None,
+                        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                        slot_mapping=_слоты,
+                    ):
+                        return self.model(**model_kwargs)
+                except Exception as _e:           # noqa: BLE001
+                    з["мёртв"] = True
+                    print(f"[MTP ГРАФ ТЕЛА] прогрев настоящей формой не прошёл "
+                          f"({type(_e).__name__}: {str(_e)[:120]}) -- прежним путём",
+                          file=__import__("sys").stderr, flush=True)
+                    return None
+            try:
+                if getattr(self, "_гр_пул", None) is None:
+                    self._гр_пул = torch.cuda.graph_pool_handle()
+                _по_слоям = по_слоям if по_слоям is not None else {
+                        имя: мета for имя in self._draft_attn_layer_names}
+                _слоты = self._get_slot_mapping(входных, cad.slot_mapping)
+                г = torch.cuda.CUDAGraph()
+                with set_forward_context(
+                    _по_слоям, self.vllm_config, num_tokens=входных,
+                    num_tokens_across_dp=None, cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    slot_mapping=_слоты,
+                ):
+                    with torch.cuda.graph(г, pool=self._гр_пул):
+                        вых = self.model(**model_kwargs)
+                з.update(граф=г, выход=вых,
+                         буферы=[(и, getattr(мета, и, None)) for и in self._ГР_ПОЛЯ])
+                г.replay()                        # захват ядра не исполнял -- шаг берёт своё
+                print(f"[MTP ГРАФ ТЕЛА] захвачен: ключ={ключ}",
+                      file=__import__("sys").stderr, flush=True)
+                return вых
+            except Exception as _e:               # noqa: BLE001
+                з["мёртв"] = True
+                print(f"[MTP ГРАФ ТЕЛА] отказ захвата ({type(_e).__name__}: {_e}) -- "
+                      f"навсегда прежним путём для ключа {ключ}",
+                      file=__import__("sys").stderr, flush=True)
+                return None
+        for и, буф in з["буферы"]:
+            нов = getattr(мета, и, None)
+            if буф is None or нов is None or нов.shape != буф.shape:
+                return None
+            if нов.data_ptr() != буф.data_ptr():
+                буф.copy_(нов, non_blocking=True)
+        self._get_slot_mapping(входных, cad.slot_mapping)
+        з["граф"].replay()
+        return з["выход"]
+
+    def _карта(self, имя: str):
+        if not _ФАЗА_ДЕВ:
+            import contextlib
+            return contextlib.nullcontext()
+        р = getattr(self, "runner", None)
+        ф = getattr(р, "_фаза_карты", None)
+        if ф is None:
+            import contextlib
+            return contextlib.nullcontext()
+        return ф(имя)
+
     def _greedy_sample(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        with self._карта("чер: словарь+argmax"):
+            return self._greedy_sample_ядро(hidden_states, spec_step_idx)
+
+    def _greedy_sample_ядро(
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
@@ -612,12 +992,40 @@ class SpecDecodeBaseProposer:
                 hidden_states, spec_step_idx
             ).argmax(dim=-1)
             return self._static_draft_vocab.token_id_map[token_ids]
-        if self.use_local_argmax_reduction:
+        if _И4 and hidden_states.shape[0] <= _И4_MMAX:
+            _т = self._i4_argmax(hidden_states)
+            if _т is not None:
+                return _т
+        # [МЕСТНЫЙ АРГМАКС ВМЕСТО СБОРА ЛОГИТОВ -- 09.09, записка 25 §250]
+        # Черновик трижды за шаг берёт аргмакс по словарю. При TP=2 обычный путь СОБИРАЕТ
+        # все логиты (248320 float на ранг = 1 МиБ x3 за шаг), хотя нужен один номер.
+        # `get_top_tokens` считает максимум по СВОЕЙ доле словаря и сводит пары
+        # (значение, номер): обмен падает с O(словарь) до O(2*ранга). У нашей модели метод
+        # есть (qwen3_5_mtp.py:509), а рычаг движка `use_local_argmax_reduction` выключен по
+        # умолчанию. Здесь он ещё и чередуемый файлом -- парно внутри ОДНОГО экземпляра,
+        # иначе разброс перезапуска (+-1.2 мс) съедает такой приз.
+        if self._местный_аргмакс() and hasattr(self.model, "get_top_tokens"):
             return self._get_top_tokens_for_step(hidden_states, spec_step_idx)
         token_ids = self._compute_logits_for_step(hidden_states, spec_step_idx).argmax(
             dim=-1
         )
         return token_ids
+
+    def _местный_аргмакс(self) -> bool:
+        if not _МЕСТ_ФАЙЛ:
+            return self.use_local_argmax_reduction
+        с = getattr(self, "_мест_сост", None)
+        if с is None:
+            с = self._мест_сост = {"вкл": False, "счёт": 0}
+        с["счёт"] += 1
+        if с["счёт"] % 64 == 1:
+            try:
+                with open(_МЕСТ_ФАЙЛ) as ф:
+                    с["вкл"] = ф.read(1) == "1"
+            except OSError:
+                с["вкл"] = False
+        return с["вкл"]
+
 
     def _sample_from_logits(
         self,
@@ -968,6 +1376,26 @@ class SpecDecodeBaseProposer:
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
 
+    # [n-ГРАММЫ В РОДНОМ MTP -- 15.09] Машинка n-грамм жила только в dflash2 (приёмка 3.86 против 2.56,
+    # x3.9 на повторяемом тексте), а dflash2 на длинном контексте вредит и обнуляет префикс-кэш -- в бою стоит
+    # родной MTP, и n-граммы туда не доставали. Здесь тот же объект (spec_decode/ngram_iz_konteksta.py)
+    # спрашивается ПЕРЕД проходом черновика: если контекст сам себя продолжает, черновик берётся оттуда РОВНО
+    # длины k (однородный декод и метаданные GDN не трогаются), а проход головы пропускается целиком. Выход не
+    # меняется ПО ПОСТРОЕНИЮ: цель сверяет каждый черновой токен точным совпадением. Рычаг FA2SM70_MTP_NGRAM=1.
+    def _нгр(self):
+        о = getattr(self, "_нгр_объект", None)
+        if о is None:
+            import os as _o
+            if _o.environ.get("FA2SM70_MTP_NGRAM", "0") != "1":
+                self._нгр_объект = False
+                return None
+            from vllm.v1.spec_decode.ngram_iz_konteksta import НГраммыИзКонтекста
+            о = self._нгр_объект = НГраммыИзКонтекста(
+                getattr(self, "runner", None), int(self.num_speculative_tokens))
+            print(f"[fa2_sm70] черновик MTP: n-ГРАММЫ ИЗ КОНТЕКСТА включены (k={self.num_speculative_tokens})",
+                  flush=True)
+        return о or None
+
     def propose(
         self,
         # [num_tokens]
@@ -988,6 +1416,15 @@ class SpecDecodeBaseProposer:
         | None = None,
     ) -> torch.Tensor:
         self._last_draft_probs = None
+        _нг_об = self._нгр() if self.method == "mtp" else None
+        if _нг_об is not None:
+            _нг = _нг_об.черновик(
+                common_attn_metadata.batch_size(),
+                int(self.num_speculative_tokens),
+                next_token_ids,
+            )
+            if _нг is not None:
+                return _нг
         if isinstance(self._static_draft_vocab, DynamicDraftVocabRuntime):
             self._static_draft_vocab.begin_proposal()
         batch_size = common_attn_metadata.batch_size()
@@ -1092,7 +1529,8 @@ class SpecDecodeBaseProposer:
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
         ):
-            ret_hidden_states = self.model(**model_kwargs)
+            with self._карта("чер: тело головы"):
+                ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
@@ -1248,6 +1686,46 @@ class SpecDecodeBaseProposer:
             profile_events, "first_sample", first_sample_start
         )
         draft_probs_list = None if draft_probs is None else [draft_probs]
+
+        # [ПРОБА ПРИЗА ДЕРЕВА -- 09.09, записка 25 §234]
+        # Уравнение пункта 4 требует приёмки ~3.4 против нынешних 2.4; дерево кандидатов --
+        # единственный измеренный путь, и его потолок -- доля случаев, когда верный токен
+        # позиции 0 стоит у черновика ВТОРЫМ. Логиты уже посчитаны, проба даровая.
+        # СВЕРКУ ДЕЛАЕТ РАННЕР, А НЕ МЫ. Первая редакция сверяла здесь, с `next_token_ids`, --
+        # и врала: бонусный токен сдвинут на число ПРИНЯТЫХ, выравнивание не то (та же ошибка
+        # уже ловилась у пробы покрытия DFlash2). Кладём кандидатов в `канд0`, а сверяет их
+        # готовая проба раннера (FA2SM70_DFLASH2_COVER) -- против `sampled_token_ids[:, 0]`,
+        # то есть против токена, который цель выдала НА ЭТОЙ ЖЕ позиции.
+        if _СБОР_СКРЫТЫХ:
+            # [СБОР ДЛЯ ДВУХСТУПЕНЧАТОГО АРГМАКСА -- 09.09, записка 25 §238-§239]
+            # Черновик читает голову словаря (1.27 ГБ на ранг) ТРИЖДЫ за шаг ради трёх
+            # аргмаксов -- 14 % шага на четыре чтения одной матрицы. Чтобы проверить замену
+            # (короткий список по сжатому представлению + точная досчитка), нужны НАСТОЯЩИЕ
+            # скрытые состояния черновика: на синтетике распределение другое, и оценка
+            # полноты списка была бы недействительной.
+            try:
+                _б = getattr(self, "_скр_буф", None)
+                if _б is None:
+                    _б = self._скр_буф = []
+                if len(_б) * sample_hidden_states.shape[0] < _СБОР_СКРЫТЫХ:
+                    _б.append(sample_hidden_states.detach().to("cpu", torch.float16))
+                elif _б:
+                    import os as _o
+                    torch.save(torch.cat(_б), f"/mnt/d1/alex/mtp_skrytye_{_o.getpid()}.pt")
+                    print(f"[MTP СБОР] сохранено {sum(x.shape[0] for x in _б)} строк",
+                          file=__import__("sys").stderr, flush=True)
+                    self._скр_буф = []
+                    globals()["_СБОР_СКРЫТЫХ"] = 0
+            except Exception as _е:
+                globals()["_СБОР_СКРЫТЫХ"] = 0
+                print(f"[MTP СБОР] отказ: {_е}", file=__import__("sys").stderr, flush=True)
+        if _ПРОБА_ТОП2:
+            try:
+                self.канд0 = self._compute_logits_for_step(
+                    sample_hidden_states, 0).topk(16, dim=-1).indices
+            except Exception as _е:
+                globals()["_ПРОБА_ТОП2"] = 0
+                print(f"[MTP ТОП-2] отказ: {_е}", file=__import__("sys").stderr, flush=True)
         if (
             _spec_dump_draft_logits_enabled(self.method)
             and not getattr(self, "_spec_logits_dumped", False)
@@ -1277,6 +1755,14 @@ class SpecDecodeBaseProposer:
             batch_size_across_dp,
             batch_descriptor,
         ) = self._determine_batch_execution_and_padding(batch_size)
+        # [ОДНОКРАТНАЯ УЛИКА -- 09.09, записка 25 §256] Выдача прохода черновика стоит 6.9 мс
+        # при карточной работе 4.3: подозрение, что тело головы идёт БЕЗ графа. Режим печатаем
+        # ОДИН раз -- гадать про это по журналу захвата нельзя, там своя разбивка.
+        if not getattr(self, "_реж_напечатан", False):
+            self._реж_напечатан = True
+            print(f"[MTP граф] режим прохода черновика: {cudagraph_runtime_mode} "
+                  f"(размер {input_batch_size}, просили {batch_size})",
+                  file=__import__("sys").stderr, flush=True)
 
         common_attn_metadata.num_actual_tokens = batch_size
         common_attn_metadata.max_query_len = 1
@@ -1307,6 +1793,7 @@ class SpecDecodeBaseProposer:
         for token_index in range(self.num_speculative_tokens - 1):
             spec_step_idx = token_index + 1
             loop_cpu_start = time.perf_counter() if profile_events is not None else 0.0
+            _т_вход = _t_eagle.perf_counter()
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
@@ -1320,16 +1807,23 @@ class SpecDecodeBaseProposer:
                     input_batch_size,
                     block_size,
                 )
+            _хф(getattr(self, "runner", None), "позиции+слоты", _т_вход)
 
             # Rebuild attention metadata. When draft positions are constant
             # (e.g. Gemma4 MTP), common_attn_metadata is invariant across
             # loop iterations so we build once and reuse.
+            _т_мета = _t_eagle.perf_counter()
             if not self.constant_draft_positions or token_index == 0:
-                _, per_layer_attn_metadata = (
+                # [FA2/SM70] Дополненная мета под свой граф тела (см. _дополнить_мету).
+                _cad = common_attn_metadata
+                if _ГР_ЧЕРН and input_batch_size != batch_size:
+                    _cad = self._дополнить_мету(_cad, batch_size, input_batch_size)
+                _группы_меты, per_layer_attn_metadata = (
                     self.build_per_group_and_layer_attn_metadata(
-                        common_attn_metadata, draft_index=spec_step_idx
+                        _cad, draft_index=spec_step_idx
                     )
                 )
+            _хф(getattr(self, "runner", None), "метаданные", _т_мета)
 
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
@@ -1365,6 +1859,7 @@ class SpecDecodeBaseProposer:
                 )
 
             loop_forward_start = self._sm70_mtp_profile_start(profile_events)
+            _т_выд = _t_eagle.perf_counter()
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
@@ -1376,7 +1871,29 @@ class SpecDecodeBaseProposer:
                 ),
                 slot_mapping=self._get_slot_mapping(input_batch_size),
             ):
-                ret_hidden_states = self.model(**model_kwargs)
+                _хф(getattr(self, "runner", None), "контекст прохода", _т_выд)
+                _т_тело = _t_eagle.perf_counter()
+                with self._карта("чер: тело головы"):
+                    # [БЕЗ ДОПОЛНЕНИЯ -- 09.09, записка 25 §257] Движок дополняет размер с 1
+                    # до 4: `adjust_cudagraph_sizes_for_spec_decode` округляет ВСЕ размеры
+                    # захвата вверх до кратного k+1 (цели нужен q=4), а у черновика размер
+                    # считается в ЗАПРОСАХ. Из-за этого метаданные описывают 1 строку, а вход
+                    # 4 -- и замок бэкенда справедливо отказал в захвате («однородный путь НЕ
+                    # взят»). СВОЕМУ графу чужие размеры захвата не нужны: берём настоящие.
+                    ret_hidden_states = None
+                    if _ГР_ЧЕРН:  # ветвь мертва по умолчанию -- ни одной операции
+                        # Форма НЕ меняется (тело запечено под неё) -- меняется только мета.
+                        ret_hidden_states = self._тело_графом(
+                            _группы_меты[0] if _группы_меты else None,
+                            input_batch_size,
+                            _cad,
+                            model_kwargs,
+                            spec_step_idx,
+                            по_слоям=per_layer_attn_metadata,
+                        )
+                    if ret_hidden_states is None:
+                        ret_hidden_states = self.model(**model_kwargs)
+                _хф(getattr(self, "runner", None), "ВЫДАЧА тела", _т_тело)
                 if not self.model_returns_tuple():
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
@@ -1388,11 +1905,13 @@ class SpecDecodeBaseProposer:
 
             hidden_states = hidden_states[:batch_size]
             loop_sample_start = self._sm70_mtp_profile_start(profile_events)
+            _т_выб = _t_eagle.perf_counter()
             draft_token_ids, draft_probs = self._sample_draft_tokens(
                 last_hidden_states[:batch_size],
                 sampling_metadata,
                 spec_step_idx=spec_step_idx,
             )
+            _хф(getattr(self, "runner", None), "словарь+argmax", _т_выб)
             self._sm70_mtp_profile_finish(
                 profile_events, f"loop{token_index}_sample", loop_sample_start
             )
@@ -1403,6 +1922,9 @@ class SpecDecodeBaseProposer:
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        if _ГЕЙТ_ДАМП:
+            _снять_gejt(target_hidden_states, input_ids if "input_ids" in dir() else None,
+                        draft_token_ids)
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         self._sm70_mtp_profile_finish(profile_events, "total_gpu", profile_total_start)
@@ -1679,9 +2201,15 @@ class SpecDecodeBaseProposer:
                 seq_len = req_state.num_computed_tokens + num_scheduled_tokens[req_id]
                 next_token_id = req_state.get_token_id(seq_len)
             next_token_ids.append(next_token_id)
-        next_token_ids = torch.tensor(
-            next_token_ids, dtype=torch.int32, device=self.input_ids.device
-        )
+        if _ЗАКРЕП:
+            # было: torch.tensor(список, device=cuda) -- синхронная копия на каждом шаге
+            next_token_ids = _закреп("next_tok",
+                                     torch.tensor(next_token_ids, dtype=torch.int32),
+                                     self.input_ids.device)
+        else:
+            next_token_ids = torch.tensor(
+                next_token_ids, dtype=torch.int32, device=self.input_ids.device
+            )
         return next_token_ids
 
     def prepare_next_token_ids_padded(
@@ -1902,11 +2430,18 @@ class SpecDecodeBaseProposer:
         #  q1 + 0, q1 + 1, q1 + 2, q1 + 3,       // req 2
         #  q1 + q2 + 0, q1 + q2 + 1, q1 + q2 + 2] // req 3
         token_indices_np = token_offsets + old_query_start_locs_expanded
-        token_indices = torch.from_numpy(token_indices_np).to(device, non_blocking=True)
+        if _ЗАКРЕП:
+            token_indices = _закреп("tok_idx", token_indices_np, device)
+            _qsl = _закреп("qsl", new_query_start_loc_cpu, device)
+            _sl = _закреп("slens", new_seq_lens_cpu, device)
+        else:
+            token_indices = torch.from_numpy(token_indices_np).to(device, non_blocking=True)
+            _qsl = new_query_start_loc_cpu.to(device, non_blocking=True)
+            _sl = new_seq_lens_cpu.to(device, non_blocking=True)
 
         spec_common_attn_metadata = CommonAttentionMetadata(
-            query_start_loc=new_query_start_loc_cpu.to(device, non_blocking=True),
-            seq_lens=new_seq_lens_cpu.to(device, non_blocking=True),
+            query_start_loc=_qsl,
+            seq_lens=_sl,
             query_start_loc_cpu=new_query_start_loc_cpu,
             _seq_lens_cpu=new_seq_lens_cpu,
             _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,

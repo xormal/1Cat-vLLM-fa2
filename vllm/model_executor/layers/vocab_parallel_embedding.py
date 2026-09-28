@@ -97,6 +97,13 @@ def _is_sm70_lm_head_fastpath_eligible(layer: torch.nn.Module) -> bool:
 def maybe_prepare_sm70_lm_head_top1(layer: torch.nn.Module) -> bool:
     if getattr(layer, "_sm70_f16_prepared", False):
         return True
+    # [fa2_sm70 28.09] НАША int8-ПРОЕКЦИЯ СЛОВАРЯ (FA2SM70_LMH != 0) ЗАМЕНЯЕТ LM head ЦЕЛИКОМ.
+    # Эта подготовка тогда лишняя: кладёт вторую копию словаря (1.3 ГБ на ранг) в кэш, ключом
+    # которого служит адрес веса -- а наш путь этот вес освобождает. Замер на обрезке сети
+    # (8 слоёв, одна карта): с подготовкой logprob сдвинуты против боевого до 0.3, без неё --
+    # 0.004 (как у чужого gptq-пути). Старое дерево (колесо 18.06) этого конфликта не имело.
+    if os.environ.get("FA2SM70_LMH", "0") not in ("", "0"):
+        return False
     if not _is_sm70_lm_head_fastpath_eligible(layer):
         return False
     prepared = sm70_ops.sm70_f16_prepare(layer.weight)
@@ -118,6 +125,12 @@ def _maybe_sm70_lm_head_forward(
     if not _sm70_env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False):
         return None
     if not getattr(layer, "_sm70_f16_prepared", False):
+        return None
+    # [fa2_sm70 28.09] Плотный вес могла забрать наша int8-проекция словаря (FA2SM70_LMH=1: она
+    # оставляет weight пустым и сбрасывает _sm70_f16_tm_weight, а флаг подготовки остаётся).
+    # Тогда этот быстрый путь считал бы по пустому весу -- на обрезке сети это дало logprob,
+    # сдвинутые до 0.3 против боевого. Отступаем, считает наш путь.
+    if getattr(layer, "weight", None) is None or layer.weight.numel() == 0:
         return None
     if not hasattr(torch.ops._C, "sm70_f16_gemm"):
         return None
@@ -155,6 +168,12 @@ def _maybe_sm70_lm_head_top1(
     if not (lm_head_top1 or lm_head_top1_tc):
         return None
     if bias is not None:
+        return None
+    # [fa2_sm70 28.09] Плотный вес могла забрать наша int8-проекция словаря (FA2SM70_LMH=1: она
+    # оставляет weight пустым и сбрасывает _sm70_f16_tm_weight, а флаг подготовки остаётся).
+    # Тогда этот быстрый путь считал бы по пустому весу -- на обрезке сети это дало logprob,
+    # сдвинутые до 0.3 против боевого. Отступаем, считает наш путь.
+    if getattr(layer, "weight", None) is None or layer.weight.numel() == 0:
         return None
     if not getattr(layer, "_sm70_f16_prepared", False):
         _trace_sm70_lm_head_skip("top1_not_prepared")

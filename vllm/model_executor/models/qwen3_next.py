@@ -8,6 +8,27 @@ from collections.abc import Iterable
 from itertools import islice
 
 import torch
+import os as _os_kva
+_KVA_DIR = _os_kva.environ.get("FA2SM70_KVA_DUMP", "")       # прибор KVA (записка 26 §6), умолчание выкл.
+_KVA_SPLIT = int(_os_kva.environ.get("FA2SM70_KVA_SPLIT", "32"))
+_KVA_N = [0]
+_KVA_SLED = [False]
+# [ПРИБОР KVA] Дамп потока через CUSTOM OP: под torch.compile Python-проверка файла замораживалась при трассировке
+# (ветка становилась мёртвой), а custom op -- непрозрачен для Dynamo и исполняется на каждом вызове.
+# mutates_args=("h",) -- чтобы компилятор не выбросил op без выходов как мёртвый код.
+@torch.library.custom_op("fa2sm70::kva_dump", mutates_args=())
+def _kva_dump_op(h: torch.Tensor, r: torch.Tensor, pos: torch.Tensor, layer: int) -> torch.Tensor:
+    # возвращает копию h, которую цикл слоёв подставляет дальше: иначе op без потребителя выбрасывается как мёртвый код
+    if _KVA_DIR and h.shape[0] >= 1024 and int(torch.cuda.current_device()) == 0 and _os_kva.path.exists(_KVA_DIR + "/ON"):
+        if not _KVA_SLED[0]:
+            _KVA_SLED[0] = True; print(f"[fa2_sm70 KVA] op дампа слоя {layer} исполняется: строк {h.shape[0]}", flush=True)
+        _KVA_N[0] += 1
+        torch.save({"h": (h + r).detach().to(torch.float16).cpu(), "pos": pos.detach().cpu()}, f"{_KVA_DIR}/h{layer}_{_KVA_N[0]:06d}.pt")
+    return h.clone()
+@_kva_dump_op.register_fake
+def _kva_dump_fake(h: torch.Tensor, r: torch.Tensor, pos: torch.Tensor, layer: int) -> torch.Tensor:
+    return torch.empty_like(h)
+# _KVA_GN и _kva_gdn_dump (дамп изнутри слоя GDN) перенесены в qwen_gdn_linear_attn.py.
 from torch import nn
 
 import vllm.envs as envs
@@ -26,6 +47,15 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
+
+# [ФАЛЬСИФИКАТОРЫ -- КОНСТАНТЫ, А НЕ ЧТЕНИЕ НА КАЖДЫЙ СЛОЙ, 31.08]
+# Рычаги снятия фаз читаются ОДИН раз при загрузке. Здесь остался только SKIP_FULLATTN
+# (слой полного внимания этого файла); SKIP_GDN/SKIP_CONV, _i16 и _вещ/_чит/_пиш переехали
+# вместе со слоем GDN в qwen_gdn_linear_attn.py (реэкспорт ниже).
+import os as _os_фальс
+_ПРОПУСК_ВНИМАНИЯ = _os_фальс.environ.get("FA2SM70_SKIP_FULLATTN", "0") == "1"
+
+
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
@@ -88,6 +118,11 @@ _SM70_QWEN_LAYER_DUMP_COUNTS: dict[str, int] = {}
 _SM70_QWEN_LAYER_DUMP_SAVE_COUNTS: dict[str, int] = {}
 _SM70_QWEN_LAYER_GRAPH_BUFFERS: dict[str, torch.Tensor] = {}
 _SM70_QWEN_LAYER_GRAPH_META: dict[str, dict[str, object]] = {}
+
+
+FA2SM70_FALSE_MLP = os.getenv("FA2SM70_FALSE_MLP", "0") == "1"
+_FALSE_MLP_СЧЁТ = 0
+FA2SM70_PHASE_PROBE_MS = float(os.getenv("FA2SM70_PHASE_PROBE_MS", "0"))
 
 
 def _sm70_profile_trace_enabled() -> bool:
@@ -311,6 +346,36 @@ def _sm70_dump_qwen_layer_tensor(
         layer_type,
     )
     return tensor
+
+
+# [FA2/SM70, ПОРТ 07.2026] РЕЭКСПОРТ ОБВЯЗКИ СЛОЯ GDN. Слой (и все наши правки к нему)
+# переехал в vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py, хелперы -- вместе
+# с ним. Имена оставлены доступными и отсюда: gdn_attn.py и gpu_model_runner.py берут
+# `from vllm.model_executor.models.qwen3_next import ДЕРЕВО_OFF` -- это ТОТ ЖЕ объект, что
+# читает слой (реестр дерева мутируется, а не переприсваивается).
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (  # noqa: E402,F401
+    FA2SM70_FALSE_GDN,
+    FA2SM70_NOGDN_SPEC,
+    PAD_SLOT_ID,
+    _i16,
+    _kva_gdn_dump,
+    _KVA_GN,
+    _БЕЗ_КОПИЙ_QKV,
+    _вещ,
+    _ДЕРЕВО_БЕЗ_BRANCH,
+    _ДЕРЕВО_W_ENV,
+    _ОБЩ_ИДX,
+    _ПРОБА_ЗАП,
+    _ПРОБА_ИТОГ,
+    _ПРОПУСК_GDN,
+    _ПРОПУСК_СВЁРТКИ,
+    _СТРАЖ,
+    _пиш,
+    _проба_записи,
+    _страж_идx,
+    _чит,
+    ДЕРЕВО_OFF,
+)
 
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
@@ -599,7 +664,14 @@ class Qwen3NextAttention(nn.Module):
             k,
         )
 
-        attn_output = self.attn(q, k, v)
+        # [FA2/SM70] ФАЛЬСИФИКАТОР СНЯТИЕМ ФАЗЫ (FA2SM70_SKIP_FULLATTN=1). Ответ при этом
+        # ЗАВЕДОМО НЕВЕРЕН -- читается ТОЛЬКО время: разность со штатным прогоном и есть
+        # доля полного внимания в стене префилла. Ставится здесь, а не в бэкенде, чтобы
+        # снять ВСЮ фазу вместе с чтением страниц KV, а не одно умножение.
+        if _ПРОПУСК_ВНИМАНИЯ:
+            attn_output = torch.zeros_like(q)
+        else:
+            attn_output = self.attn(q, k, v)
         attn_output = _sm70_dump_qwen_layer_tensor(
             "full_attn_core_out",
             self.layer_idx,
@@ -790,7 +862,18 @@ class Qwen3NextDecoderLayer(nn.Module):
             self.layer_type,
             residual,
         )
-        hidden_states = self.mlp(hidden_states)
+        # [FA2/SM70 27.08] ФАЛЬСИФИКАТОР СНЯТИЕМ ФАЗЫ MLP (FA2SM70_FALSE_MLP=1).
+        # Ответ заведомо неверен, читается ТОЛЬКО время. Нужен, чтобы разложить остаток
+        # наклона по позициям: обмен даёт 0.90 мс/позицию, GDN 0.53, а 0.90 ещё не отнесены
+        # ни к чему, при том что внимание даёт лишь 0.07.
+        if not FA2SM70_FALSE_MLP:
+            hidden_states = self.mlp(hidden_states)
+        else:
+            global _FALSE_MLP_СЧЁТ
+            _FALSE_MLP_СЧЁТ += 1
+            if _FALSE_MLP_СЧЁТ in (1, 1000, 100000):
+                print(f"[fa2_sm70] ФАЛЬСИФИКАТОР MLP сработал {_FALSE_MLP_СЧЁТ} раз",
+                      file=__import__("sys").stderr, flush=True)
         hidden_states = _sm70_dump_qwen_layer_tensor(
             "mlp_out",
             self.layer_idx,
@@ -878,6 +961,13 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        # [FA2/SM70 27.08] ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ ПРИБОРА ФАЗ (FA2SM70_PHASE_PROBE_MS=N).
+        # Вставляет в проход ЗАВЕДОМО ИЗВЕСТНУЮ задержку. Прибор обязан показать РОВНО её
+        # прибавку в фазе «прямой проход цели». Без такого контроля показания прибора не
+        # доказывают ничего -- сегодня слепой гейт сведения стоил семи итераций отладки.
+        if FA2SM70_PHASE_PROBE_MS:
+            torch.cuda._sleep(int(FA2SM70_PHASE_PROBE_MS * 1.4e6))
+
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         trace_enabled = _sm70_profile_trace_enabled()
         if trace_enabled:
@@ -900,6 +990,10 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                     tuple(hidden_states.shape),
                     residual is not None,
                 )
+            # [FA2/SM70 13.09, ПРИБОР KVA] Дамп потока (hidden + residual) на входе слоя FA2SM70_KVA_SPLIT через custom op
+            # (записка 26 §6); условия по константам -- при трассировке, проверка флага ON -- внутри op во время работы.
+            if _KVA_DIR and getattr(layer, "layer_idx", -1) == _KVA_SPLIT and residual is not None:
+                hidden_states = torch.ops.fa2sm70.kva_dump(hidden_states, residual, positions, _KVA_SPLIT)
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1115,11 +1209,13 @@ class Qwen3NextForCausalLM(
         cache_config = vllm_config.cache_config
 
         scheduler_config = vllm_config.scheduler_config
-        if cache_config.mamba_cache_mode == "all":
-            raise NotImplementedError(
-                "Qwen3Next currently does not support 'all' prefix caching, "
-                "please use '--mamba-cache-mode=align' instead"
-            )
+        # [FA2/SM70, задача 194] Запрет СНЯТ: режим 'all' на нашем пути реализован целиком --
+        # метаданные (gdn_attn.py: mamba_block_size + три индекса блоков), декод (наш
+        # volta_gdn_rec принимает ssm_state_indices_out -- запись в блок, отличный от блока
+        # чтения) и префилл (сегментация куска по границам блоков с записью состояния в блок
+        # последнего токена каждого отрезка). Это единственная настоящая починка пары
+        # MTP + префикс-кэш: в 'align' движок копирует состояние между слотами мимо нашей
+        # таблицы масштабов, из-за чего int16-состояние и спекуляция с кэшем не складывались.
         self.quant_config = vllm_config.quant_config
 
         super().__init__()
@@ -1168,10 +1264,19 @@ class Qwen3NextForCausalLM(
         cls,
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
-            vllm_config.model_config.dtype,
-            vllm_config.cache_config.mamba_cache_dtype,
-            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        # [FA2/SM70, ПОРТ 07.2026] int16-состояние GDN -- тот же тип, что выделит слой
+        # (иначе страница mamba считается под fp32 'auto' и int16-пул добивается паддингом).
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            fa2_gdn_state_dtypes,
+        )
+
+        return fa2_gdn_state_dtypes(
+            MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+                vllm_config.model_config.dtype,
+                vllm_config.cache_config.mamba_cache_dtype,
+                vllm_config.cache_config.mamba_ssm_cache_dtype,
+            ),
+            vllm_config.cache_config,
         )
 
     @classmethod

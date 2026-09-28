@@ -206,7 +206,18 @@ say "бэкенд внимания: $VLLM_ATTENTION_BACKEND$([ -n "${FA2SM70_BAC
 export VLLM_FLASH_V100_ENABLE_PAGED_PREFILL=1
 export VLLM_SM70_ENABLE_LM_HEAD_FASTPATH=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-export VLLM_GPTQ_ZERO_C=fold
+# [28.09] СВЁРТКА ОБНУЛЕНИЙ (fold) -- ТОЛЬКО НА БОЕВОМ ДЕРЕВЕ vLLM (колесо 18.06).
+# В новом дереве (репо 1Cat-vLLM-fa2, upstream от июля) иная реализация в q_gemm.cu учит длину
+# прохода на первом проходе вне графа, а новый движок гонит первые проходы подряд в захвате:
+# подъём падает «fold: обучение отравлено» (замер на обрезке сети 28.09). Там -- обычное
+# обнуление (1), это цена ~0.5 мс/токен, не правильности. Дерево опознаётся без импорта vLLM.
+if [ -z "${VLLM_GPTQ_ZERO_C:-}" ]; then
+  if "$PY" -c "import importlib.util as u, os, sys; s=u.find_spec('vllm'); sys.exit(0 if os.path.exists(os.path.join(os.path.dirname(s.origin),'v1','spec_decode','llm_base_proposer.py')) else 1)" 2>/dev/null; then
+    export VLLM_GPTQ_ZERO_C=1
+  else
+    export VLLM_GPTQ_ZERO_C=fold
+  fi
+fi
 export FA2SM70_PATH="$FA2"
 export FA2SM70_BUILD_DIR="$BUILD_DIR"
 export FA2SM70_SHIM_PREFILL=1 FA2SM70_SHIM_DECODE=1 FA2SM70_SHIM_STORE=1
@@ -284,6 +295,7 @@ export FA2SM70_TM8="${FA2SM70_TM8:-0}"
 # СТРУКТУРУ графа черновика. Без него в ключе старый граф достался бы новой структуре --
 # ровно отказ, ради которого этот отпечаток и заведён.
 _STRUKT="${FA2SM70_W8:-}|${FA2SM70_TM8:-}|${FA2SM70_TM8_ONLY:-}|${FA2SM70_TM8_NMIN:-}|${FA2SM70_W12:-}|${FA2SM70_DRAFT_TM8:-}|${FA2SM70_LMH:-}|${FA2SM70_FMLP:-}|${FA2SM70_GDN_I16:-}|${FA2SM70_MTP_W8:-}|${FA2SM70_MTP_W8_NSPLIT:-}"
+[ "${BOEVAYA_SET:-abl}" = "abl" ] || _STRUKT="$_STRUKT|set=$BOEVAYA_SET"   # [28.09] как в боевом пускаче
 _OTP=$(printf '%s' "$_STRUKT" | md5sum | cut -c1-8)
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$HOME/.cache/vllm_fa2sm70_$_OTP}"
 say "кэш компиляции: $VLLM_CACHE_ROOT (otpechatok rychagov $_OTP)"

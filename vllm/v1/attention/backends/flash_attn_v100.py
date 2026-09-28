@@ -929,6 +929,47 @@ def _get_paged_kv_utils():
     return _paged_kv_utils
 
 
+_CALIB_SCALES = None          # {layer_name: (k_scale, v_scale)}
+_CALIB_DEFAULT = (1.0, 1.0)   # conservative default for layers not in the file
+
+
+def _load_calib_scales():
+    """Load offline-calibrated static KV scales from KV_SCALES_FILE (once)."""
+    global _CALIB_SCALES, _CALIB_DEFAULT
+    if _CALIB_SCALES is not None:
+        return
+    _CALIB_SCALES = {}
+    path = os.environ.get("KV_SCALES_FILE")
+    if not path or not os.path.exists(path):
+        return
+    try:
+        import json
+        d = json.load(open(path))
+        ks, vs = [], []
+        for ln, e in d.items():
+            k = float(e["k_scale"]); v = float(e["v_scale"])
+            if k > 0 and v > 0:
+                _CALIB_SCALES[ln] = (k, v); ks.append(k); vs.append(v)
+        if ks:
+            # Uncovered layers (e.g. layer 0) get the max scale -> no clipping.
+            _CALIB_DEFAULT = (max(ks), max(vs))
+        logger.info("FLASH_ATTN_V100: loaded %d calibrated KV scales from %s "
+                    "(default for uncovered=%s)", len(_CALIB_SCALES), path, _CALIB_DEFAULT)
+    except Exception as exc:
+        logger.warning("FLASH_ATTN_V100: failed to load KV scales from %s: %s", path, exc)
+
+
+def _kv_scales(layer):
+    """Return (k_scale, v_scale): calibrated static if available, else the
+    layer's own runtime scale."""
+    _load_calib_scales()
+    if _CALIB_SCALES:
+        ln = getattr(layer, "layer_name", None)
+        k, v = _CALIB_SCALES.get(ln, _CALIB_DEFAULT)
+        return float(k), float(v)
+    return float(layer._k_scale_float), float(layer._v_scale_float)
+
+
 def _has_prefix_context(attn_metadata: TritonAttentionMetadata) -> bool:
     """Return True if any sequence has KV context before current query tokens."""
     query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
@@ -2744,6 +2785,39 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self._decode_cache_len = 0
         self._decode_cache_capacity = 0
 
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        # SM70 fp8 KV write: Triton can't emit e4m3fn stores on Volta, so route
+        # fp8 writes through the custom CUDA kernel (unblocks e4m3). Non-fp8
+        # (auto/fp16) and encoder/kv-sharing cases defer to the parent.
+        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+            return
+        # [port 28.09] upstream added "fp8_per_token_head" (own scale caches, own writer in the
+        # parent): it also starts with "fp8" but is NOT the layout our kernel writes -> parent.
+        if (not self.kv_cache_dtype.startswith("fp8")
+                or getattr(self, "_is_per_token_head_quant", False)):
+            return super().do_kv_cache_update(layer, key, value, kv_cache,
+                                              slot_mapping)
+        if (self.kv_sharing_target_layer_name is not None
+                or key is None or value is None):
+            return
+        try:
+            from flash_attn_v100 import reshape_and_cache_fp8
+        except ImportError:
+            return super().do_kv_cache_update(layer, key, value, kv_cache,
+                                              slot_mapping)
+        key_cache, value_cache = kv_cache.unbind(1)  # uint8 paged caches
+        # allow_i8: the private int8+per-position-scale layout is legal ONLY while every reader of
+        # these bytes is ours. If this layer's attention does not run on our path (sliding window,
+        # alibi, soft-cap ...), Triton reads the same bytes as e4m3 and the output is garbage. Gemma-4
+        # has 40 such layers out of 48. The pool stays mixed on purpose -- the shim tags the format per
+        # cache. e4m3 is still written by our kernel here, because Triton cannot emit e4m3 on Volta.
+        reshape_and_cache_fp8(
+            key, value, key_cache, value_cache, slot_mapping,
+            self.kv_cache_dtype,
+            _kv_scales(layer)[0], _kv_scales(layer)[1],
+            allow_i8=self._supports_flash_v100_path(),
+        )
+
     def _reset_decode_cache(self) -> None:
         self._decode_cache_k = None
         self._decode_cache_v = None
@@ -2887,8 +2961,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             softmax_scale=self.scale,
             out=raw_bhmd,
             kv_cache_dtype=self.kv_cache_dtype,
-            k_scale=float(layer._k_scale_float),
-            v_scale=float(layer._v_scale_float),
+            k_scale=_kv_scales(layer)[0],
+            v_scale=_kv_scales(layer)[1],
             causal=True,
         )
         self._write_bhmd_compare_report(
@@ -3058,8 +3132,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 k_cont,
                 v_cont,
                 self.kv_cache_dtype,
-                float(layer._k_scale_float),
-                float(layer._v_scale_float),
+                _kv_scales(layer)[0],
+                _kv_scales(layer)[1],
             )
             payload["cache_key"] = k_cont.detach().cpu()
             payload["cache_value"] = v_cont.detach().cpu()
@@ -3167,8 +3241,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             k_cont,
             v_cont,
             self.kv_cache_dtype,
-            float(layer._k_scale_float),
-            float(layer._v_scale_float),
+            _kv_scales(layer)[0],
+            _kv_scales(layer)[1],
         )
         query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
         seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
@@ -3468,8 +3542,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 softmax_scale=self.scale,
                 out=out,
                 kv_cache_dtype=self.kv_cache_dtype,
-                k_scale=float(layer._k_scale_float),
-                v_scale=float(layer._v_scale_float),
+                k_scale=_kv_scales(layer)[0],
+                v_scale=_kv_scales(layer)[1],
                 window_size=window_size,
                 max_seq_len_hint=max_seq_len_hint,
                 workspace_seq_capacity_hint=workspace_seq_capacity_hint,
@@ -3487,8 +3561,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             softmax_scale=self.scale,
             out=out,
             kv_cache_dtype=self.kv_cache_dtype,
-            k_scale=float(layer._k_scale_float),
-            v_scale=float(layer._v_scale_float),
+            k_scale=_kv_scales(layer)[0],
+            v_scale=_kv_scales(layer)[1],
             window_size=window_size,
             max_seq_len_hint=max_seq_len_hint,
             workspace_seq_capacity_hint=workspace_seq_capacity_hint,
@@ -4190,8 +4264,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         softmax_scale=self.scale,
                         out=out_wmma,
                         kv_cache_dtype=self.kv_cache_dtype,
-                        k_scale=float(layer._k_scale_float),
-                        v_scale=float(layer._v_scale_float),
+                        k_scale=_kv_scales(layer)[0],
+                        v_scale=_kv_scales(layer)[1],
                     )
                     return output
                 if (
@@ -4218,8 +4292,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                             attn_metadata.seq_lens[:num_seqs],
                             softmax_scale=self.scale,
                             kv_cache_dtype=self.kv_cache_dtype,
-                            k_scale=float(layer._k_scale_float),
-                            v_scale=float(layer._v_scale_float),
+                            k_scale=_kv_scales(layer)[0],
+                            v_scale=_kv_scales(layer)[1],
                             causal=True,
                         )
                     raw_q_bhmd = q_bhmd
@@ -4241,8 +4315,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         softmax_scale=self.scale,
                         out=out_bhmd,
                         kv_cache_dtype=self.kv_cache_dtype,
-                        k_scale=float(layer._k_scale_float),
-                        v_scale=float(layer._v_scale_float),
+                        k_scale=_kv_scales(layer)[0],
+                        v_scale=_kv_scales(layer)[1],
                         causal=True,
                     )
                     if safe_bmhd is not None:
@@ -4268,8 +4342,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     attn_metadata.seq_lens[:num_seqs],
                     softmax_scale=self.scale,
                     kv_cache_dtype=self.kv_cache_dtype,
-                    k_scale=float(layer._k_scale_float),
-                    v_scale=float(layer._v_scale_float),
+                    k_scale=_kv_scales(layer)[0],
+                    v_scale=_kv_scales(layer)[1],
                     causal=True,
                 )
                 if first_query_len == 1 and q_bhmd.is_contiguous():
@@ -4304,8 +4378,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 attn_metadata.seq_lens[i : i + 1],
                 softmax_scale=self.scale,
                 kv_cache_dtype=self.kv_cache_dtype,
-                k_scale=float(layer._k_scale_float),
-                v_scale=float(layer._v_scale_float),
+                k_scale=_kv_scales(layer)[0],
+                v_scale=_kv_scales(layer)[1],
                 causal=True,
             )
             out_view[start:end].copy_(out_seq.squeeze(0))
@@ -4473,8 +4547,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 k_cont,
                 v_cont,
                 self.kv_cache_dtype,
-                float(layer._k_scale_float),
-                float(layer._v_scale_float),
+                _kv_scales(layer)[0],
+                _kv_scales(layer)[1],
             )
             out_seq = self.flash_attn_func(
                 query[start:end].unsqueeze(0),
@@ -4586,8 +4660,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 softmax_scale=self.scale,
                 out=out_view,
                 kv_cache_dtype=self.kv_cache_dtype,
-                k_scale=float(layer._k_scale_float),
-                v_scale=float(layer._v_scale_float),
+                k_scale=_kv_scales(layer)[0],
+                v_scale=_kv_scales(layer)[1],
                 window_size=window_size,
                 max_seq_len_hint=getattr(
                     attn_metadata,
@@ -4626,8 +4700,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             softmax_scale=self.scale,
             out=out_view,
             kv_cache_dtype=self.kv_cache_dtype,
-            k_scale=float(layer._k_scale_float),
-            v_scale=float(layer._v_scale_float),
+            k_scale=_kv_scales(layer)[0],
+            v_scale=_kv_scales(layer)[1],
             window_size=window_size,
             max_seq_len_hint=getattr(
                 attn_metadata,
@@ -4869,8 +4943,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                                 cache_k_by_slot,
                                 cache_v_by_slot,
                                 self.kv_cache_dtype,
-                                float(layer._k_scale_float),
-                                float(layer._v_scale_float),
+                                _kv_scales(layer)[0],
+                                _kv_scales(layer)[1],
                             )
                         )
                         key_diff = (cache_k_by_slot - key[start:end]).abs()
@@ -4907,8 +4981,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 k_cont,
                 v_cont,
                 self.kv_cache_dtype,
-                float(layer._k_scale_float),
-                float(layer._v_scale_float),
+                _kv_scales(layer)[0],
+                _kv_scales(layer)[1],
             )
             if prefix_len + q_len <= k_cont.shape[0]:
                 k_cont[prefix_len : prefix_len + q_len].copy_(key[start:end])
@@ -5352,6 +5426,35 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         return out
 
+    def _fa2sm70_prefill_kwargs(self) -> dict:
+        """[fa2_sm70 patch] Optional kwargs of the loaded paged-prefill op, probed ONCE.
+
+        `out=`         -- the op writes straight into the engine's output buffer (our kernels take
+                          output strides), which removes a full copy of the attention output per
+                          layer per chunk. Kill switch: VLLM_FLASH_V100_NO_DIRECT_OUT=1.
+        `seq_lens_cpu=`-- the sequence length from the host, removing one device->host sync per
+                          layer per chunk (the op otherwise reads it off a CUDA tensor).
+        Both are OPTIONAL on purpose: an older op without them keeps the previous behaviour, and the
+        pointer test at the bottom of the loop still copies when `out` was not honoured.
+        """
+        kw = getattr(self, "_fa2sm70_prefill_kw", None)
+        if kw is None:
+            import inspect
+            try:
+                params = inspect.signature(self.flash_attn_prefill_paged).parameters
+            except (TypeError, ValueError):
+                params = {}
+            kw = {
+                "out": ("out" in params)
+                and os.getenv("VLLM_FLASH_V100_NO_DIRECT_OUT", "0") != "1",
+                "seq_lens_cpu": ("seq_lens_cpu" in params)
+                and os.getenv("VLLM_FLASH_V100_NO_CPU_SEQLENS", "0") != "1",
+            }
+            self._fa2sm70_prefill_kw = kw
+            logger.info("FLASH_ATTN_V100 paged prefill: direct out=%s, host seq_lens=%s",
+                        kw["out"], kw["seq_lens_cpu"])
+        return kw
+
     def _flash_v100_prefill_with_prefix(
         self,
         layer: torch.nn.Module,
@@ -5449,13 +5552,28 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 seq_lens,
             )
 
+        # [fa2_sm70 patch] Which optional kwargs the loaded prefill op understands (probed once).
+        fa2_kw = self._fa2sm70_prefill_kwargs()
+
         for i in range(num_seqs):
             start = int(query_start_loc[i].item())
             end = int(query_start_loc[i + 1].item())
             if end <= start:
                 continue
 
+            out_slice = out_view[start:end]
             if self.use_flash_v100_prefill_paged:
+                # [fa2_sm70 patch] Hand the kernel THIS buffer (it takes output strides) and the
+                # host-side length. Without `out` the op writes its own buffer and we copy it below
+                # -- 2 x q_len x H x d bytes per layer per chunk. Without `seq_lens_cpu` the op has
+                # to read the length off the device: one full sync per layer per chunk.
+                # Passed ONLY to the plain paged-prefill op (route prefill_prefix_paged and the
+                # fp8-bridge fallback); the other routes return their own tensor and are copied below.
+                extra = {}
+                if fa2_kw["out"]:
+                    extra["out"] = out_slice.unsqueeze(0)
+                if fa2_kw["seq_lens_cpu"] and seq_lens_cpu is not None:
+                    extra["seq_lens_cpu"] = seq_lens_cpu[i:i + 1]
                 q_len = end - start
                 seq_len = int(seq_lens[i].item())
                 q_seq = query[start:end].unsqueeze(0)
@@ -5561,8 +5679,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                             self.prefill_bfla_mask_block_n,
                             softmax_scale=self.scale,
                             kv_cache_dtype=self.kv_cache_dtype,
-                            k_scale=float(layer._k_scale_float),
-                            v_scale=float(layer._v_scale_float),
+                            k_scale=_kv_scales(layer)[0],
+                            v_scale=_kv_scales(layer)[1],
                             causal=causal,
                             window_size=window_size,
                         ),
@@ -5638,8 +5756,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         value_cache=value_cache,
                         block_table=attn_metadata.block_table[i : i + 1],
                         seq_lens=attn_metadata.seq_lens[i : i + 1],
-                        k_scale=float(layer._k_scale_float),
-                        v_scale=float(layer._v_scale_float),
+                        k_scale=_kv_scales(layer)[0],
+                        v_scale=_kv_scales(layer)[1],
                         causal=causal,
                         window_size=window_size,
                     )
@@ -5662,10 +5780,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                             attn_metadata.seq_lens[i : i + 1],
                             softmax_scale=self.scale,
                             kv_cache_dtype=self.kv_cache_dtype,
-                            k_scale=float(layer._k_scale_float),
-                            v_scale=float(layer._v_scale_float),
+                            k_scale=_kv_scales(layer)[0],
+                            v_scale=_kv_scales(layer)[1],
                             causal=causal,
                             window_size=window_size,
+                            **extra,
                         )
                 elif use_splitkv:
                     if not _logged_prefill_prefix_splitkv:
@@ -5697,8 +5816,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                             attn_metadata.seq_lens[i : i + 1],
                             softmax_scale=self.scale,
                             kv_cache_dtype=self.kv_cache_dtype,
-                            k_scale=float(layer._k_scale_float),
-                            v_scale=float(layer._v_scale_float),
+                            k_scale=_kv_scales(layer)[0],
+                            v_scale=_kv_scales(layer)[1],
                             causal=causal,
                             window_size=window_size,
                             split_kv_tokens=self.prefill_split_kv_tokens,
@@ -5714,7 +5833,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         heads_kv=num_kv_heads,
                         head_dim=head_dim,
                         block_size=block_size,
-                        fn=lambda q_seq=q_seq, i=i: self.flash_attn_prefill_paged(  # type: ignore[misc]
+                        fn=lambda q_seq=q_seq, i=i, extra=extra: self.flash_attn_prefill_paged(  # type: ignore[misc]
                             q_seq,
                             key_cache,
                             value_cache,
@@ -5722,10 +5841,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                             attn_metadata.seq_lens[i : i + 1],
                             softmax_scale=self.scale,
                             kv_cache_dtype=self.kv_cache_dtype,
-                            k_scale=float(layer._k_scale_float),
-                            v_scale=float(layer._v_scale_float),
+                            k_scale=_kv_scales(layer)[0],
+                            v_scale=_kv_scales(layer)[1],
                             causal=causal,
                             window_size=window_size,
+                            **extra,
                         ),
                     )
                 need_dense_debug = (
@@ -5745,8 +5865,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         k_cont,
                         v_cont,
                         self.kv_cache_dtype,
-                        float(layer._k_scale_float),
-                        float(layer._v_scale_float),
+                        _kv_scales(layer)[0],
+                        _kv_scales(layer)[1],
                     )
                     if bool(getattr(layer, "is_dflash_draft_attn", False)):
                         ref_out = _torch_attention_reference(
@@ -5827,8 +5947,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                                         cache_k_by_slot,
                                         cache_v_by_slot,
                                         self.kv_cache_dtype,
-                                        float(layer._k_scale_float),
-                                        float(layer._v_scale_float),
+                                        _kv_scales(layer)[0],
+                                        _kv_scales(layer)[1],
                                     )
                                 )
                                 key_input = key[start:end]
@@ -5966,8 +6086,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     k_cont,
                     v_cont,
                     self.kv_cache_dtype,
-                    float(layer._k_scale_float),
-                    float(layer._v_scale_float),
+                    _kv_scales(layer)[0],
+                    _kv_scales(layer)[1],
                 )
 
                 out_seq = self.flash_attn_func(
@@ -5978,7 +6098,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     softmax_scale=self.scale,
                     window_size=window_size,
                 )
-            out_view[start:end].copy_(out_seq.squeeze(0))
+            # [fa2_sm70 patch] Copy ONLY if the op did not write our buffer itself. The pointer test
+            # is what makes this safe for every op version: an op that ignores `out` returns its own
+            # tensor and is copied exactly as before.
+            if out_seq.data_ptr() != out_slice.data_ptr():
+                out_slice.copy_(out_seq.squeeze(0))
 
         return output
 

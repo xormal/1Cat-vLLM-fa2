@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 
@@ -176,6 +177,9 @@ def _mark_default_sm70_dense_modules(model: nn.Module, tp_size: int) -> None:
             continue
         if prefix.rsplit(".", 1)[-1] in suffixes:
             module._sm70_f16_force_enable = True
+
+
+_FA2SM70_MAMBA_ALL = os.environ.get("FA2SM70_MAMBA_ALL", "0") == "1"
 
 
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
@@ -401,6 +405,9 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             )
 
 
+_FA2SM70_MEGA = os.environ.get("FA2SM70_MEGA") == "1"   # решается ОДИН раз, при импорте
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -411,6 +418,8 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         "inputs_embeds": 0,
     }
 )
+
+
 class Qwen3_5Model(Qwen3NextModel):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super(Qwen3NextModel, self).__init__()
@@ -455,6 +464,15 @@ class Qwen3_5Model(Qwen3NextModel):
             self.norm = PPMissingLayer()
 
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+
+        # [fa2_sm70] ВЛАДЕЛЕЦ СЕБЯ ОБЪЯВЛЯЕТ. Шесть попыток опознать держатель слоёв снаружи (класс,
+        # структура, поле, сборщик мусора, обёртка forward) дали ноль: тело внимания его не видит, а
+        # forward закрыт torch.compile. Регистрация в точке СОЗДАНИЯ -- единственный ключ по владению.
+        try:
+            import fa2_sm70.megastep as _fa2ms
+            _fa2ms.register_model(self)
+        except Exception:
+            pass
 
     def load_fused_expert_weights(
         self,
@@ -681,10 +699,16 @@ class Qwen3_5ForCausalLMBase(
         cache_config = vllm_config.cache_config
 
         scheduler_config = vllm_config.scheduler_config
-        if cache_config.mamba_cache_mode == "all":
+        # [FA2/SM70, задача 194] РЕЖИМ 'all' РЕАЛИЗОВАН: состояние GDN сохраняется на каждой
+        # границе блока (gdn_attn.py -- индексы блоков, qwen3_next.py -- резка префилла по
+        # границам и раздельные блоки чтения/записи в декоде). Запрет снят, но включение
+        # оставлено РЫЧАГОМ FA2SM70_MAMBA_ALL=1: 'all' держит страницы под ВСЕ 64 слоя, а не
+        # под 16 слоёв внимания, и при том же пуле ёмкость контекста падает ~392K -> ~98K.
+        # Это размен, а не улучшение, поэтому умолчанием он не становится.
+        if cache_config.mamba_cache_mode == "all" and not _FA2SM70_MAMBA_ALL:
             raise NotImplementedError(
-                "Qwen3.5 currently does not support 'all' prefix caching, "
-                "please use '--mamba-cache-mode=align' instead"
+                "Режим 'all' собран, но выключен: включается FA2SM70_MAMBA_ALL=1 "
+                "(цена -- ёмкость контекста, см. research/23)"
             )
         self.quant_config = vllm_config.quant_config
 
@@ -819,6 +843,12 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
     # Qwen3.5 does not support multimodal pruning (EVS).
     supports_multimodal_pruning = False
+
+    # ВОЗМОЖНОСТЬ, а не желание: режим 'all' для GDN реализован (задача 194). Объявлять его
+    # УСЛОВНО нельзя -- реестр кэширует сведения о классе по хэшу МОДУЛЯ и переменных
+    # окружения не видит, поэтому условный атрибут один раз попал в кэш как «нет поддержки»
+    # и залип. Выбор режима -- рычагом FA2SM70_MAMBA_ALL в config.py, где он и уместен.
+    supports_mamba_prefix_caching = True
 
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
@@ -958,10 +988,19 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         cls,
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
-            vllm_config.model_config.dtype,
-            vllm_config.cache_config.mamba_cache_dtype,
-            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        # [FA2/SM70, ПОРТ 07.2026] int16-состояние GDN -- тот же тип, что выделит слой
+        # (иначе страница mamba считается под fp32 'auto' и int16-пул добивается паддингом).
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            fa2_gdn_state_dtypes,
+        )
+
+        return fa2_gdn_state_dtypes(
+            MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+                vllm_config.model_config.dtype,
+                vllm_config.cache_config.mamba_cache_dtype,
+                vllm_config.cache_config.mamba_ssm_cache_dtype,
+            ),
+            vllm_config.cache_config,
         )
 
     @classmethod

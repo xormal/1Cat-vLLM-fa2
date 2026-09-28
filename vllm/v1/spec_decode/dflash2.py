@@ -243,7 +243,7 @@ class DFlash2Proposer(SpecDecodeBaseProposer):
             dtype=torch.int32,
         )
 
-        from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
+        from vllm.model_executor.models.qwen3_dflash_fa2sm70 import dflash_has_any_non_causal
 
         # Внутри блока маска ДВУСТОРОННЯЯ -- иначе блочная выдача теряет смысл. У нашего ядра
         # признак причинности -- параметр, поэтому это берётся без правки ядра.
@@ -273,7 +273,7 @@ class DFlash2Proposer(SpecDecodeBaseProposer):
         pass
 
     def load_model(self, target_model: torch.nn.Module) -> None:
-        from vllm.model_executor.models.qwen3_dflash import (
+        from vllm.model_executor.models.qwen3_dflash_fa2sm70 import (
             dflash_target_rope_is_neox_style,
         )
 

@@ -139,6 +139,11 @@ def _select_sm70_num_stages(T: int) -> int:
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
         "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
+        # РЕЖИМ 'all' (задача 194): состояние ЧИТАЕТСЯ из блока последнего посчитанного
+        # токена, а ПИШЕТСЯ в блок последнего запланированного -- на шаге перехода
+        # границы это РАЗНЫЕ блоки. Копировать состояние вместо этого нельзя: у GDN оно
+        # 1.5 МиБ на слой, и копия на каждом шаге стоила бы дороже самого шага.
+        "HAS_OUT_INDICES": lambda args: args["ssm_state_indices_out"] is not None,
     }
 )
 @triton.jit(do_not_specialize=["N", "T"])
@@ -153,6 +158,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     ht,
     cu_seqlens,
     ssm_state_indices,
+    ssm_state_indices_out,
     num_accepted_tokens,
     scale,
     N: tl.int64,  # num of sequences
@@ -175,6 +181,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     IS_VARLEN: tl.constexpr,
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
+    HAS_OUT_INDICES: tl.constexpr,
     IS_KDA: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -270,9 +277,12 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         # keep the states for multi-query tokens
         if INPLACE_FINAL_STATE:
             # Load state index and check for invalid entries.
-            final_state_idx = tl.load(
-                ssm_state_indices + i_n * stride_indices_seq + i_t
-            ).to(tl.int64)
+            if HAS_OUT_INDICES:
+                final_state_idx = tl.load(ssm_state_indices_out + i_n).to(tl.int64)
+            else:
+                final_state_idx = tl.load(
+                    ssm_state_indices + i_n * stride_indices_seq + i_t
+                ).to(tl.int64)
             if final_state_idx >= 0:
                 p_ht = ht + final_state_idx * stride_final_state_token
                 p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
@@ -304,6 +314,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     inplace_final_state: bool = True,
     cu_seqlens: torch.Tensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
+    ssm_state_indices_out: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -350,6 +361,7 @@ def fused_recurrent_gated_delta_rule_fwd(
         ht=final_state,
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
+        ssm_state_indices_out=ssm_state_indices_out,
         num_accepted_tokens=num_accepted_tokens,
         scale=scale,
         N=N,
@@ -627,6 +639,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
         inplace_final_state: bool = True,
         cu_seqlens: torch.Tensor | None = None,
         ssm_state_indices: torch.Tensor | None = None,
+        ssm_state_indices_out: torch.Tensor | None = None,
         num_accepted_tokens: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
     ):
@@ -641,6 +654,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
             inplace_final_state=inplace_final_state,
             cu_seqlens=cu_seqlens,
             ssm_state_indices=ssm_state_indices,
+            ssm_state_indices_out=ssm_state_indices_out,
             num_accepted_tokens=num_accepted_tokens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
@@ -659,6 +673,8 @@ def fused_recurrent_gated_delta_rule(
     inplace_final_state: bool = True,
     cu_seqlens: torch.Tensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
+    # Куда класть состояние, если это НЕ тот же блок, откуда оно прочитано (режим 'all').
+    ssm_state_indices_out: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -748,6 +764,7 @@ def fused_recurrent_gated_delta_rule(
         inplace_final_state,
         cu_seqlens,
         ssm_state_indices,
+        ssm_state_indices_out,
         num_accepted_tokens,
         use_qk_l2norm_in_kernel,
     )

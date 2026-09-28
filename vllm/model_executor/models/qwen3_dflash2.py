@@ -50,7 +50,7 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from .qwen3_dflash import (
+from .qwen3_dflash_fa2sm70 import (
     DFlashQwen3DecoderLayer,
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
