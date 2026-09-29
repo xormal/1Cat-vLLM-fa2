@@ -50,7 +50,8 @@ BASE="$RUNDIR/serve_qwen38_int8.sh"
 # У каждой сети СВОЙ склад w12: имя файла склада зависит только от раскладки TP, не от сети, и
 # общий каталог отдал бы новой сети веса внимания старой -- тихо, без отказа.
 # Кэш компиляции для abl остаётся прежним (ключ не меняется), для cyber -- свой.
-export BOEVAYA_SET="${BOEVAYA_SET:-abl}"   # экспорт: базовый пускач считает тот же отпечаток кэша
+# [29.09] УМОЛЧАНИЕ -- cyber (переключено по решению владельца). Откат: abl.
+export BOEVAYA_SET="${BOEVAYA_SET:-cyber}"   # экспорт: базовый пускач считает тот же отпечаток кэша
 case "$BOEVAYA_SET" in
   abl)   _SET_MODEL=/mnt/d1/alex/VLLM_ch/Qwen3.8-27B-ABL_int8_i12;   _SET_W12="$RUNDIR/.w12_qwen38abl_prod" ;;
   cyber) _SET_MODEL=/mnt/d1/alex/VLLM_ch/Qwen3.8-27B-Cyber_int8_i12; _SET_W12="$RUNDIR/.w12_qwen38cyber_prod" ;;
