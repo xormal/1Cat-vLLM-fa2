@@ -16,6 +16,90 @@ Qwen-class AWQ and experimental FP8 models on Volta GPUs. It integrates
 TurboMind-derived SM70 kernels, a V100 FlashAttention path, runtime defaults
 for long-context serving, and OpenAI-compatible API fixes for common clients.
 
+## This fork: FA2 on SM70, int8, and what each approach bought
+
+`xormal/1Cat-vLLM-fa2`, branch `fa2-sm70-port`, adds its own SM70 attention backend
+(`FA2_SM70`, kernels in [xormal/V100-SM_70-Flash-Attn-2-v1](https://github.com/xormal/V100-SM_70-Flash-Attn-2-v1)),
+GPTQ int8 bodies, and a speculative-decoding stack. The reference deployment is
+**Qwen3.8-27B in GPTQ int8 (+12-bit attention weights) on 2 x V100-SXM2-32GB, TP=2 over
+NVLink, 262 144-token int8 KV cache**. Launchers and every lever with its reason:
+[`deployment/v100_qwen38/`](deployment/v100_qwen38/README.md).
+
+| | start (int8 port, no speculation) | now |
+|---|---|---|
+| decode, short prompt | 32-35 tok/s | **66 tok/s** on code (3.89 tokens accepted per step), 48-51 on prose |
+| decode at 210K context | — | 39 tok/s |
+| 250K-token prefill | 334 s dense | **198 s**, 12/12 needles, prefix-cache repeat x10-18 |
+| context on two cards | 97K tokens | **262 144 tokens** |
+
+The numbers below were measured on this hardware, one change at a time. Where a change
+has no isolated number, the mechanism is given instead.
+
+### Speculative decoding (the main multiplier)
+
+| Approach | Lever | Measured effect |
+|---|---|---|
+| Native MTP head of the model, k=3 | `--speculative-config {"method":"mtp",...,"num_speculative_tokens":3}` | with prefix cache and full graph 33.1 -> 50.5 tok/s short; k=3 is the optimum (56.9 vs 47.5 at k=1, 55.5 at k=7) |
+| Speculation inside the CUDA graph | backend declares `UNIFORM_BATCH` (query_len = k+1) | without it the step ran eagerly: 277 ms vs 29.5 ms |
+| k+1 must be a captured graph size | `cudagraph_capture_sizes [1,2,4,8]` | k=5 halved the speed (draft ran without a graph); valid k are 1, 3, 7 |
+| Virtual batch: the k+1 positions are rows of one batch | attention kernel | MTP decode 11.3 -> 17.3 tok/s (3.3 -> 7.3 at long context) |
+| Virtual batch without host copies | kernel reads the request as `r/q` | +3.7 %, output byte-identical |
+| MTP head in int8 on our kernel | `FA2SM70_MTP_W8=1`, `FA2SM70_MTP_W8_NSPLIT=4` | head pass x2.74, -202 MiB per rank |
+| Draft body on the tensor-core int8 path | `FA2SM70_DRAFT_TM8=1` | draft uses turbomind int8 instead of scalar gemv |
+| Draft from n-grams of the context | `FA2SM70_MTP_NGRAM=1` | accepted length 3.86 vs 2.56 for MTP alone; 71.6 tok/s on repetitive text |
+| Source-selection rule that does not get stuck | `FA2SM70_MTP_NGRAM_FIX=1` | n-gram searches -72 %, keeps "search" mode on code-heavy traffic |
+
+### Linear bodies (decode is bound by reading the weights)
+
+| Approach | Lever | Measured effect |
+|---|---|---|
+| Checkpoint in GPTQ int8 (RTN, group 128, asymmetric) | model format | 55 -> 32 GB: half the bytes per step; tensor error 6e-3 |
+| Own int8 GEMV for M=1 | `FA2SM70_W8=1` | x2.0-2.7 over the stock kernel, 73-86 % of the read roofline |
+| tm8: TurboMind GPTQ-8 on tensor cores for the M=k+1 zone | `FA2SM70_TM8=1`, `FA2SM70_TM8_ONLY=1`, `FA2SM70_TM8_NMIN=3072` | flat in M at 93 % of roofline; cost per extra draft position 4.2 -> 2.0 ms |
+| Per-start autotune of tm8 variant / split-K / tile | `FA2SM70_TM8_TUNE=1` | makes tm8 win on narrow shapes too |
+| Column width of the GEMV at M=4 | kernel rule | x1.33-1.53; `down_proj` 46 -> 71 % of roofline |
+| Attention weights (qkv) in 12 bits | `FA2SM70_W12=1` | 0.75 byte per weight instead of 2, more precise than bf16 |
+| Vocabulary projection in int8 | `FA2SM70_LMH=1` | 98 % of the read roofline; dense copy freed (-620 MB per rank) |
+| Large-M bodies through reconstruct + cuBLAS | `FA2SM70_TM8_RECON_MMIN=1024`, `FA2SM70_TM8_RECON_OUT=1` | +2.8 % prefill |
+
+### Graph and host work
+
+| Approach | Lever | Measured effect |
+|---|---|---|
+| Full CUDA graph for decode | `FA2SM70_CG=1`, `cudagraph_mode=full_and_piecewise` | x1.084-1.091 |
+| GDN metadata built once per step, not once per KV group (10 groups) | shared computation | 9.9 -> 6.37 ms per step |
+| The graph reads the addresses of buffers that are actually filled | shared, capture-time buffers | GDN metadata 6.37 -> 1.13 ms; 42.2 tok/s |
+| Shared buffers instead of copies | `FA2SM70_GDN_SHARED_BUF=1` | 2.43 -> 1.34 ms; 42.8 -> 44.2 tok/s |
+| Removed work nobody read | `fused_gdn_gating` | was computed 48 times per step; removed byte-identically |
+| Exact top-k/top-p without two full sorts of the 248 320 vocabulary | `FA2SM70_TOPKP_FAST=1` | +1.6-2.0 %, 0 of 10 563 live rows differ |
+| No Python in the hot path | — | Python in the path cost 12.5 % and broke TP |
+
+### Attention and KV cache (grows with context)
+
+| Approach | Lever | Measured effect |
+|---|---|---|
+| int8 KV cache, per-token-per-head scale | `--kv-cache-dtype int8_per_token_head` | half the KV reads; 262 144 tokens on two cards |
+| GDN state in int16, separate pools, state block x8 | `FA2SM70_GDN_I16=1`, `FA2SM70_SPLIT_POOLS=1`, `FA2SM70_MAMBA_BLK_MULT=8` | the state paid 48 of 69 KiB per token; 250K fits together with speculation |
+| Hybrid decode kernel, head grouping GF=6 | kernel | optimum on three axes (row fusion 0.66x, extra splits worse) |
+| Decode path chosen by length: uniform up to ~65K, prefill-style beyond | `FA2SM70_UNIFORM_MAXLEN=65000` | 13.5K: 29.9 -> 44.5 tok/s |
+| Sparse decode, 15 % of blocks per row and head | `FA2SM70_SPARSE_DEC=1`, `_TOPF=0.15`, `_MINBLK=256` | x1.16; switches itself off below 16K tokens |
+| 64 splits, not 160 | `FA2SM70_MAX_SPLITS=64` | 160 was tuned for dense decode and shattered sparse work |
+| Sparse prefill with a per-dimension bound (Hoelder) | `FA2SM70_SPARSE_MASS=0.85`, `_GAMMA=0.5`, `_MINSQ=2048` | 250K prefill 334 -> 198 s at dense-equal quality (12/12, ladder 32/32) |
+
+### Measured and switched off
+
+| Tried | Why it is off |
+|---|---|
+| 12-bit compression of the TP exchange on NVLink | x0.79-0.81, a loss (`FA2SM70_EXCH12=0`) |
+| Own all-reduce | hangs; the full graph already brought the exchange cost to 1.5 % |
+| Candidate tree in the kernel | the accepted branch corrupts context: 1.835 -> 1.762 accepted per step |
+| DFlash2 block draft | hurts at long context (x0.76 at 8K) and zeroes prefix-cache hits |
+
+**How the 66 tok/s adds up.** Without speculation the full-graph decode step is 30.5 ms:
+weights 15.9 (the floor), attention 3.6, exchange 2.6, GDN almost zero. Speculation
+turns one step into several tokens: 3.89 accepted per step at a ~59 ms step gives 66
+tok/s on code-like text. Prose accepts less, hence 48-51 tok/s there.
+
 ## Project Focus
 
 - **V100 / SM70 first**: optimized for Tesla V100 rather than being a generic
